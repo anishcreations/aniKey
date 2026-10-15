@@ -8,6 +8,7 @@
 #import <CoreBluetooth/CoreBluetooth.h>
 #include <signal.h>
 #include <stdint.h>
+#include <math.h>
 #include <unistd.h>
 
 static volatile sig_atomic_t Interrupted = 0;
@@ -46,6 +47,8 @@ static void Pump(NSTimeInterval seconds) {
 #pragma mark - HID encoding and SDP
 
 // Report 1: modifiers, reserved, six usages; output: five LED bits + padding.
+// Report 10 avoids report 2, which existing hosts may cache as consumer controls.
+// Mouse: two button bits, relative X/Y, neutral Z/wheel. Boot mouse uses ID 2.
 static NSData *ReportDescriptor(void) {
     const uint8_t descriptor[] = {
         0x05,0x01, 0x09,0x06, 0xA1,0x01, 0x85,0x01,
@@ -56,6 +59,12 @@ static NSData *ReportDescriptor(void) {
         0x75,0x03, 0x95,0x01, 0x91,0x01,
         0x05,0x07, 0x19,0x00, 0x29,0x65, 0x15,0x00, 0x25,0x65,
         0x75,0x08, 0x95,0x06, 0x81,0x00, 0xC0,
+        0x05,0x01, 0x09,0x02, 0xA1,0x01, 0x85,0x0A,
+        0x09,0x01, 0xA1,0x00, 0x05,0x09, 0x19,0x01, 0x29,0x02,
+        0x15,0x00, 0x25,0x01, 0x75,0x01, 0x95,0x02, 0x81,0x02,
+        0x75,0x06, 0x95,0x01, 0x81,0x01,
+        0x05,0x01, 0x09,0x30, 0x09,0x31, 0x09,0x32, 0x09,0x38, 0x15,0x81, 0x25,0x7F,
+        0x75,0x08, 0x95,0x04, 0x81,0x06, 0xC0,0xC0,
     };
     return Bytes(descriptor, sizeof(descriptor));
 }
@@ -78,9 +87,9 @@ static NSDictionary *ServiceDictionary(void) {
         @"0006": @[SDPNumber(0x656E,2), SDPNumber(106,2), SDPNumber(0x0100,2)],
         @"0009": @[@[SDPUUID(0x1124), SDPNumber(0x0101,2)]],
         @"000D": @[@[@[SDPUUID(0x0100), SDPNumber(0x0013,2)], @[SDPUUID(0x0011)]]],
-        @"0100": @"aniKey Bluetooth Keyboard", @"0101": @"Native macOS input for Android",
+        @"0100": @"aniKey Bluetooth Keyboard and Mouse", @"0101": @"Native macOS input for Android",
         @"0102": @"aniKey",
-        @"0201": SDPNumber(0x0111,2), @"0202": SDPNumber(0x40,1),
+        @"0201": SDPNumber(0x0111,2), @"0202": SDPNumber(0xC0,1),
         @"0203": SDPNumber(33,1), @"0204": SDPBoolean(YES), @"0205": SDPBoolean(YES),
         @"0206": @[@[SDPNumber(0x22,1), @{@"DataElementType": @4, @"DataElementValue": ReportDescriptor()}]],
         @"0207": @[@[SDPNumber(0x0409,2), SDPNumber(0x0100,2)]],
@@ -110,12 +119,59 @@ static BOOL ServiceHasExpectedDescriptor(IOBluetoothSDPServiceRecord *record) {
     }
     return NO;
 }
+static NSString *ServiceValidationError(IOBluetoothSDPServiceRecord *record) {
+    if (!ServiceHasExpectedDescriptor(record)) return @"HID descriptor mismatch; input blocked.";
+    BluetoothL2CAPPSM control = 0;
+    IOReturn status = [record getL2CAPPSM:&control];
+    if (status != kIOReturnSuccess) return IOError(@"Reading published control PSM",status);
+    if (control != 0x11) return [NSString stringWithFormat:@"Published control PSM 0x%04X does not match 0x0011; input blocked.",control];
+    NSArray *controlProtocols = [[record getAttributeDataElement:0x0004] getArrayValue];
+    NSArray *controlHIDP = controlProtocols.count == 2 ? [controlProtocols[1] getArrayValue] : nil;
+    if (controlHIDP.count != 1 || ![[controlHIDP[0] getUUIDValue] isEqualToUUID:[IOBluetoothSDPUUID uuid16:0x0011]])
+        return @"Published control protocol is missing or malformed; input blocked.";
+    NSArray *lists = [[record getAttributeDataElement:0x000D] getArrayValue];
+    NSArray *protocols = lists.count == 1 ? [lists[0] getArrayValue] : nil;
+    NSArray *l2cap = protocols.count == 2 ? [protocols[0] getArrayValue] : nil;
+    NSArray *hidp = protocols.count == 2 ? [protocols[1] getArrayValue] : nil;
+    if (l2cap.count != 2 || hidp.count != 1 ||
+        ![[l2cap[0] getUUIDValue] isEqualToUUID:[IOBluetoothSDPUUID uuid16:0x0100]] ||
+        ![[hidp[0] getUUIDValue] isEqualToUUID:[IOBluetoothSDPUUID uuid16:0x0011]] || ![l2cap[1] getNumberValue])
+        return @"Published interrupt protocol is missing or malformed; input blocked.";
+    unsigned interrupt = [[l2cap[1] getNumberValue] unsignedIntValue];
+    if (interrupt != 0x13) return [NSString stringWithFormat:@"Published interrupt PSM 0x%04X does not match 0x0013; input blocked.",interrupt];
+    return nil;
+}
 static NSData *KeyboardReport(uint8_t modifiers, NSArray<NSNumber *> *usages) {
     uint8_t report[8] = {modifiers, 0, 0, 0, 0, 0, 0, 0};
     if (usages.count > 6) memset(report+2,1,6);
     else for (NSUInteger i = 0; i < usages.count; i++) report[2+i] = usages[i].unsignedCharValue;
     return Bytes(report, sizeof(report));
 }
+static NSData *MouseReport(uint8_t buttons, int x, int y) {
+    const uint8_t bytes[] = {(uint8_t)(buttons & 3),(uint8_t)x,(uint8_t)y,0,0};
+    return Bytes(bytes,5);
+}
+
+// Keep at most a small amount of relative motion; preserve fractional points.
+@interface PointerMotion : NSObject
+@property double x, y;
+- (void)addX:(double)x y:(double)y;
+- (NSData *)takeReport;
+- (void)reset;
+@end
+@implementation PointerMotion
+- (void)addX:(double)x y:(double)y {
+    if (!isfinite(x) || !isfinite(y)) return;
+    self.x = MAX(-512,MIN(512,self.x+x)); self.y = MAX(-512,MIN(512,self.y+y));
+}
+- (NSData *)takeReport {
+    int x = (int)MAX(-127,MIN(127,self.x)), y = (int)MAX(-127,MIN(127,self.y));
+    if (!x && !y) return nil;
+    self.x -= x; self.y -= y; return MouseReport(0,x,y);
+}
+- (void)reset { self.x = self.y = 0; }
+@end
+
 typedef struct { uint8_t usage, modifiers; } Key;
 static BOOL ASCIIKey(unichar character, Key *key) {
     key->modifiers = 0;
@@ -187,10 +243,14 @@ static NSString *NormalizeAddress(NSString *raw) {
 
 @interface AnikeySession : NSObject <IOBluetoothL2CAPChannelDelegate>
 @property BOOL dryRun, trace, ready, suspended, connecting, closing, cancelRequested;
+// Mouse input becomes available only after both channel completions and startup write.
+@property BOOL mouseValidated, mouseDiagnostics;
+@property NSUInteger mouseProbeRemaining;
+@property (copy) NSString *mouseDiagnostic;
 @property uint8_t protocolMode, LEDs;
 @property NSUInteger keyDelayMS;
 @property (copy) NSString *lastError;
-@property (strong) NSData *keyboard;
+@property (strong) NSData *keyboard, *mouse;
 @property (strong) IOBluetoothDevice *device;
 @property (strong) IOBluetoothSDPServiceRecord *service;
 @property (strong) IOBluetoothL2CAPChannel *control, *interrupt;
@@ -203,6 +263,7 @@ static NSString *NormalizeAddress(NSString *raw) {
 - (BOOL)tap:(Key)key;
 - (BOOL)tap:(Key)key waitAfterRelease:(BOOL)wait;
 - (BOOL)typeText:(NSString *)text;
+- (BOOL)probeMouse:(NSString *)action;
 - (void)handlePacket:(NSData *)packet control:(BOOL)control;
 - (void)disconnect;
 - (void)stop;
@@ -212,7 +273,7 @@ static NSString *NormalizeAddress(NSString *raw) {
 - (instancetype)init {
     if ((self = [super init])) {
         _protocolMode = 1; _keyDelayMS = 50;
-        _keyboard = KeyboardReport(0,@[]);
+        _keyboard = KeyboardReport(0,@[]); _mouse = MouseReport(0,0,0);
     }
     return self;
 }
@@ -229,21 +290,27 @@ static NSString *NormalizeAddress(NSString *raw) {
 - (BOOL)openPSM:(BluetoothL2CAPPSM)psm {
     IOBluetoothL2CAPChannel *channel = nil;
     NSString *stage = [NSString stringWithFormat:@"Opening %@ PSM 0x%04X", psm == 0x11 ? @"control" : @"interrupt", psm];
-    // The modern Classic bridge may return success from Async without submitting
-    // an open request. Use the public synchronous path, also used by current HID implementations.
-    self.openingPSM = psm;
-    IOReturn result = [self.device openL2CAPChannelSync:&channel withPSM:psm delegate:self];
+    self.openingPSM = psm; self.completion = NO;
+    IOReturn result = [self.device openL2CAPChannelAsync:&channel withPSM:psm delegate:self];
+    // The current macOS bridge can return an inert channel from Async. Explicit
+    // public delegate registration starts its streams and delivers OpenComplete.
+    if (result == kIOReturnSuccess && channel && channel.PSM == psm && !self.cancelRequested)
+        result = [channel setDelegate:self];
+    BOOL matched = channel && channel.PSM == psm;
+    BOOL opened = result == kIOReturnSuccess && matched && !self.cancelRequested && [self waitForCompletion:stage];
     self.openingPSM = 0;
-    if (result != kIOReturnSuccess || !channel || self.cancelRequested) {
-        // Modern SDKs can return a channel object even on failure. The channel
-        // retains its delegate: detach and close it before scheduling another attempt.
+    if (!opened) {
         IOBluetoothL2CAPChannel *adopted = psm == 0x11 ? self.control : self.interrupt;
         [channel setDelegate:nil]; [channel closeChannel];
         if (adopted && adopted != channel) { [adopted setDelegate:nil]; [adopted closeChannel]; }
         if (psm == 0x11) self.control = nil; else self.interrupt = nil;
-        return [self fail:self.cancelRequested ? @"Connection cancelled." : IOError(stage,result == kIOReturnSuccess ? kIOReturnError : result)];
+        if (self.cancelRequested) return [self fail:@"Connection cancelled."];
+        if (result != kIOReturnSuccess) return [self fail:IOError(stage,result)];
+        if (channel && !matched) return [self fail:[NSString stringWithFormat:@"HID channel mismatch: requested PSM 0x%04X, actual 0x%04X; input blocked.",psm,channel.PSM]];
+        return [self fail:self.lastError ?: IOError(stage,kIOReturnError)];
     }
     if (psm == 0x11) self.control = channel; else self.interrupt = channel;
+    self.mouseDiagnostic = [NSString stringWithFormat:@"HID channel open completed: PSM=0x%04X.",psm];
     return YES;
 }
 - (BOOL)connect:(NSString *)address {
@@ -251,7 +318,7 @@ static NSString *NormalizeAddress(NSString *raw) {
     self.lastError = nil; self.closing = NO; self.connecting = YES;
     if (self.cancelRequested) { self.connecting = NO; return [self fail:@"Connection cancelled."]; }
     self.protocolMode = 1; self.LEDs = 0; self.suspended = NO;
-    self.keyboard = KeyboardReport(0,@[]);
+    self.keyboard = KeyboardReport(0,@[]); self.mouse = MouseReport(0,0,0);
     if (self.dryRun) { self.ready = YES; self.connecting = NO; return YES; }
     IOBluetoothHostController *host = IOBluetoothHostController.defaultController;
     if (!host || host.powerState != kBluetoothHCIPowerStateON) {
@@ -269,14 +336,11 @@ static NSString *NormalizeAddress(NSString *raw) {
         if (!self.service) Pump(0.1);
     }
     if (!self.service) { [self fail:@"Mac Bluetooth pairing is present, but the keyboard service could not start. Quit and reopen aniKey from Finder after allowing Bluetooth access. If it persists, this macOS session may be restricting HID publication."]; goto failed; }
-    if (!ServiceHasExpectedDescriptor(self.service)) {
-        [self fail:@"The Mac published a different HID report layout. Input is stopped to avoid sending an unexpected keyboard layout. Quit other Bluetooth keyboard emulators and reconnect aniKey."];
-        [self stop]; return NO;
+    {
+        NSString *serviceError = ServiceValidationError(self.service);
+        if (serviceError) { [self fail:serviceError]; [self stop]; return NO; }
     }
-    // SDP publishing may remap occupied PSMs. Log actual values for hardware diagnosis.
-    BluetoothL2CAPPSM publishedPSM = 0;
-    if ([self.service getL2CAPPSM:&publishedPSM] == kIOReturnSuccess && publishedPSM != 0x11)
-        fprintf(stderr,"Warning: macOS published control PSM 0x%04X instead of 0x0011; host compatibility is uncertain.\n", publishedPSM);
+    self.mouseDiagnostic = @"Local SDP descriptor and PSMs match. Android mouse recognition remains unverified.";
     if (!self.device.isConnected) {
         self.completion = NO; self.openingPSM = 0;
         IOReturn result = [self.device openConnection:self withPageTimeout:0x2000 authenticationRequired:YES];
@@ -292,6 +356,7 @@ static NSString *NormalizeAddress(NSString *raw) {
     Pump(0.25); // Service negotiation callbacks run before the first input.
     if (!self.ready || self.cancelRequested) goto failed;
     if (![self sendReport:1 payload:self.keyboard]) goto failed;
+    self.mouseValidated = YES;
     return YES;
 failed:
     [self disconnect]; return NO;
@@ -302,7 +367,7 @@ failed:
     }
 }
 - (void)l2capChannelOpenComplete:(IOBluetoothL2CAPChannel *)channel status:(IOReturn)status {
-    if (self.connecting && channel.PSM == self.openingPSM) {
+    if (self.connecting && channel.PSM == self.openingPSM && channel.device == self.device) {
         self.completionStatus = status; self.completion = YES;
         if (status == kIOReturnSuccess && channel.device == self.device) {
             if (channel.PSM == 0x11) self.control = channel;
@@ -335,13 +400,47 @@ failed:
 - (BOOL)sendReport:(uint8_t)reportID payload:(NSData *)payload {
     if (!self.ready) return [self fail:self.lastError ?: @"Not connected."];
     if (self.suspended) return [self fail:@"The host suspended input. Wait for EXIT_SUSPEND or reconnect."];
-    if (reportID != 1 || payload.length != 8) return [self fail:@"Invalid keyboard report."];
-    const uint8_t prefix[] = {0xA1,reportID};
+    if (!((reportID == 1 && payload.length == 8) || (reportID == 10 && payload.length == 5))) return [self fail:@"Invalid input report."];
+    if (reportID == 10) {
+        const uint8_t *bytes = payload.bytes;
+        if ((bytes[0] & ~3) || bytes[3] || bytes[4] || bytes[1] == 0x80 || bytes[2] == 0x80)
+            return [self fail:@"Invalid mouse fields: only left/right buttons and bounded X/Y movement are supported."];
+        NSString *state = (self.mouseValidated || self.mouseProbeRemaining) ? @"attempt" : @"blocked: mouse unavailable";
+        self.mouseDiagnostic = [NSString stringWithFormat:@"Mouse report=%u payload=%lu wire=%lu HIDP=A1 mode=%@ channel=interrupt PSM=0x%04X buttons=%u dx=%d dy=%d %@",
+            self.protocolMode ? 10 : 2,(unsigned long)(self.protocolMode ? 5 : 3),(unsigned long)(self.protocolMode ? 7 : 5),self.protocolMode ? @"report" : @"boot",self.interrupt ? self.interrupt.PSM : 0x13,bytes[0],(int8_t)bytes[1],(int8_t)bytes[2],state];
+        if (self.mouseDiagnostics) fprintf(stderr,"%s\n",self.mouseDiagnostic.UTF8String);
+        if (!self.mouseValidated && !self.mouseProbeRemaining) return [self fail:@"Mouse input is unavailable until the HID connection completes."];
+        if (self.mouseProbeRemaining) self.mouseProbeRemaining--;
+    }
+    uint8_t wireID = reportID == 10 && !self.protocolMode ? 2 : reportID;
+    const uint8_t prefix[] = {0xA1,wireID};
+
     NSMutableData *packet = [Bytes(prefix,2) mutableCopy];
-    [packet appendData:payload];
-    if (![self writePacket:packet control:NO]) return NO;
-    self.keyboard = payload;
+    [packet appendData:reportID == 10 && !self.protocolMode ? [payload subdataWithRange:NSMakeRange(0,3)] : payload];
+    BOOL sent = [self writePacket:packet control:NO];
+    if (reportID == 10) {
+        self.mouseDiagnostic = [self.mouseDiagnostic stringByAppendingString:sent ? @" · sent" : @" · write failed"];
+        if (self.mouseDiagnostics) fprintf(stderr,"%s\n",self.mouseDiagnostic.UTF8String);
+    }
+    if (!sent) return NO;
+    if (reportID == 1) self.keyboard = payload;
+    else self.mouse = MouseReport(((const uint8_t *)payload.bytes)[0],0,0);
     return YES;
+}
+- (BOOL)probeMouse:(NSString *)action {
+    NSDictionary *directions = @{@"left":@[@-1,@0],@"right":@[@1,@0],@"up":@[@0,@-1],@"down":@[@0,@1]};
+    NSArray *delta = directions[action];
+    BOOL leftClick = [action isEqual:@"left-click"], rightClick = [action isEqual:@"right-click"];
+    if (!delta && !leftClick && !rightClick) return [self fail:@"mouse-test requires left, right, up, down, left-click, or right-click."];
+    self.mouseDiagnostics = YES;
+    fprintf(stderr,"One bounded mouse test; no input is retried.\n");
+    self.mouseProbeRemaining = delta ? 1 : 2;
+    @try {
+        if (delta) return [self sendReport:10 payload:MouseReport(0,[delta[0] intValue],[delta[1] intValue])];
+        if (![self sendReport:10 payload:MouseReport(leftClick ? 1 : 2,0,0)]) return NO;
+        Pump(0.02);
+        return [self sendReport:10 payload:MouseReport(0,0,0)];
+    } @finally { self.mouseProbeRemaining = 0; }
 }
 - (BOOL)tap:(Key)key {
     return [self tap:key waitAfterRelease:YES];
@@ -383,7 +482,7 @@ failed:
             if (parameter == 3) self.suspended = YES;
             else if (parameter == 4) self.suspended = NO;
             else if (parameter == 5) { self.lastError = @"Host requested virtual cable unplug. Reconnect explicitly."; [self stop]; }
-            else if (parameter == 1) { self.protocolMode = 1; self.suspended = NO; self.keyboard = KeyboardReport(0,@[]); }
+            else if (parameter == 1) { self.protocolMode = 1; self.suspended = NO; self.keyboard = KeyboardReport(0,@[]); self.mouse = MouseReport(0,0,0); }
             break;
         case 4: { // GET_REPORT: type in bits 0..1, optional little-endian buffer size.
             BOOL sized = (parameter & 8) != 0;
@@ -391,6 +490,7 @@ failed:
             uint8_t type = parameter & 3, reportID = p[1];
             NSData *payload = nil;
             if (type == 1 && reportID == 1) payload = self.keyboard;
+            else if (type == 1 && reportID == (self.protocolMode ? 10 : 2)) payload = self.protocolMode ? self.mouse : [self.mouse subdataWithRange:NSMakeRange(0,3)];
             else if (type == 2 && reportID == 1) { uint8_t led = self.LEDs; payload = Bytes(&led,1); }
             else { [self handshake:(type == 1 || type == 2) ? 2 : 3]; break; }
             NSMutableData *body = [Bytes(&reportID,1) mutableCopy]; [body appendData:payload];
@@ -420,7 +520,7 @@ failed:
     }
 }
 - (void)l2capChannelData:(IOBluetoothL2CAPChannel *)channel data:(void *)pointer length:(size_t)length {
-    // A synchronous open can dispatch data before returning its channel pointer.
+    // Channel setup can dispatch data before the open-completion callback.
     if (self.connecting && channel.PSM == self.openingPSM && channel.device == self.device) {
         if (channel.PSM == 0x11 && !self.control) self.control = channel;
         else if (channel.PSM == 0x13 && !self.interrupt) self.interrupt = channel;
@@ -434,8 +534,9 @@ failed:
     NSString *previousError = self.lastError;
     if (self.ready && !self.suspended) {
         if (memcmp(self.keyboard.bytes, (uint8_t[8]){0},8) != 0) [self sendReport:1 payload:KeyboardReport(0,@[])];
+        if (((const uint8_t *)self.mouse.bytes)[0]) [self sendReport:10 payload:MouseReport(0,0,0)];
     }
-    self.ready = NO; self.connecting = NO;
+    self.ready = NO; self.connecting = NO; self.mouseValidated = NO;
     [self.control setDelegate:nil]; [self.interrupt setDelegate:nil];
     [self.control closeChannel]; [self.interrupt closeChannel];
     self.control = nil; self.interrupt = nil;
@@ -463,6 +564,7 @@ static BOOL ParseInteger(NSString *text, NSInteger low, NSInteger high, NSIntege
 static BOOL ValidateCommand(NSArray<NSString *> *args, NSString **error) {
     if (!args.count) return Fail(error,@"Missing command; use --help.");
     NSString *command = args[0]; NSUInteger count = args.count - 1;
+    if ([command isEqual:@"mouse-test"]) return count == 1 && [@[@"left",@"right",@"up",@"down",@"left-click",@"right-click"] containsObject:args[1]] ? YES : Fail(error,@"mouse-test requires left, right, up, down, left-click, or right-click.");
     if ([command isEqual:@"pin"] || [command isEqual:@"text"]) {
         if (count != 1) return Fail(error,@"pin/text requires exactly one quoted argument.");
         if ([command isEqual:@"pin"] && (!args[1].length || [args[1] rangeOfCharacterFromSet:[NSCharacterSet characterSetWithCharactersInString:@"0123456789"].invertedSet].location != NSNotFound))
@@ -480,6 +582,7 @@ static BOOL ExecuteCommand(AnikeySession *session, NSArray<NSString *> *args) {
     if (!ValidateCommand(args,&error)) { session.lastError = error; return NO; }
     NSString *command = args[0];
     if ([command isEqual:@"check"]) return session.ready;
+    if ([command isEqual:@"mouse-test"]) return [session probeMouse:args[1]];
     if ([command isEqual:@"text"]) return [session typeText:args[1]];
     if ([command isEqual:@"pin"]) return [session typeText:args[1]] && [session tap:(Key){0x28,0}];
     if ([command isEqual:@"key"]) {
@@ -578,6 +681,13 @@ static uint8_t PhysicalModifiers(NSEventModifierFlags flags) {
 @interface KeyboardSurface : NSView
 @property (weak) AnikeyApp *owner;
 @end
+@interface CursorPad : NSView
+@property (weak) AnikeyApp *owner;
+@property (strong) NSTrackingArea *tracking;
+@property BOOL controlling, pressed;
+@property NSPoint lastPoint;
+- (void)reset;
+@end
 @interface AnikeyApp : NSObject <NSApplicationDelegate, NSWindowDelegate, CBCentralManagerDelegate>
 @property (strong) AnikeySession *session;
 @property (strong) TransportWorker *transport;
@@ -586,6 +696,11 @@ static uint8_t PhysicalModifiers(NSEventModifierFlags flags) {
 @property (strong) NSTextField *status;
 @property (strong) NSButton *connectionButton, *refreshButton;
 @property (strong) KeyboardSurface *keyboardSurface;
+@property (strong) CursorPad *cursorPad;
+@property (strong) PointerMotion *motion;
+@property (strong) NSTimer *pointerTimer;
+@property BOOL pointerBusy;
+@property NSUInteger pointerEpoch;
 @property (strong) NSMutableArray<NSButton *> *inputControls;
 @property (strong) NSPopover *detailsPopover;
 @property (strong) NSTimer *timer;
@@ -598,6 +713,10 @@ static uint8_t PhysicalModifiers(NSEventModifierFlags flags) {
 @property NSUInteger connectionGeneration, inputEpoch;
 @property (copy) NSString *selectedAddress;
 - (BOOL)canSendInput;
+- (void)resetPointer;
+- (void)flushPointer:(NSTimer *)timer;
+- (void)pointerClick:(NSButton *)sender;
+- (void)sendPointerButton:(uint8_t)button;
 - (void)physicalKey:(unsigned short)code down:(BOOL)down flags:(NSEventModifierFlags)flags;
 - (void)physicalFlags:(NSEvent *)event;
 - (void)releaseInput;
@@ -632,10 +751,64 @@ static uint8_t PhysicalModifiers(NSEventModifierFlags flags) {
 }
 @end
 
+@implementation CursorPad
+- (BOOL)isFlipped { return YES; }
+- (void)resetCursorRects { [self addCursorRect:self.bounds cursor:NSCursor.crosshairCursor]; }
+- (BOOL)acceptsFirstMouse:(NSEvent *)event { (void)event; return NO; }
+- (void)updateTrackingAreas {
+    [super updateTrackingAreas]; if (self.tracking) [self removeTrackingArea:self.tracking];
+    self.tracking = [[NSTrackingArea alloc] initWithRect:NSZeroRect options:NSTrackingMouseMoved|NSTrackingMouseEnteredAndExited|NSTrackingActiveInKeyWindow|NSTrackingInVisibleRect owner:self userInfo:nil];
+    [self addTrackingArea:self.tracking];
+}
+- (void)reset { self.controlling = self.pressed = NO; self.needsDisplay = YES; }
+- (void)mouseEntered:(NSEvent *)event {
+    if (self.owner.terminating) return;
+    self.controlling = YES; self.lastPoint = [self convertPoint:event.locationInWindow fromView:nil]; self.needsDisplay = YES;
+}
+- (void)mouseMoved:(NSEvent *)event {
+    if (self.owner.terminating) return;
+    NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
+    if (!NSPointInRect(point,self.bounds)) { [self.owner resetPointer]; return; }
+    if (!self.controlling) { [self mouseEntered:event]; return; } // First entry establishes an origin, never a jump.
+    if (self.owner.session.mouseValidated && [self.owner canSendInput]) [self.owner.motion addX:point.x-self.lastPoint.x y:point.y-self.lastPoint.y];
+    self.lastPoint = point; self.needsDisplay = YES;
+}
+- (void)mouseDown:(NSEvent *)event {
+    [self mouseMoved:event];
+    if (!self.controlling) return;
+    self.pressed = YES; self.needsDisplay = YES;
+    [self.owner sendPointerButton:1]; // A click, never a held remote drag.
+}
+- (void)mouseDragged:(NSEvent *)event { [self mouseMoved:event]; }
+- (void)mouseUp:(NSEvent *)event { (void)event; self.pressed = NO; self.needsDisplay = YES; }
+- (void)scrollWheel:(NSEvent *)event { (void)event; } // No wheel/consumer controls in this increment.
+- (void)mouseExited:(NSEvent *)event { (void)event; [self.owner resetPointer]; }
+- (void)drawRect:(NSRect)dirty {
+    (void)dirty;
+    [NSColor.controlBackgroundColor setFill];
+    NSBezierPath *shape = [NSBezierPath bezierPathWithRoundedRect:NSInsetRect(self.bounds,0.5,0.5) xRadius:10 yRadius:10];
+    [shape fill]; [(self.controlling ? NSColor.controlAccentColor : NSColor.separatorColor) setStroke]; [shape stroke];
+    BOOL available = self.owner.session.mouseValidated && [self.owner canSendInput];
+    NSString *title = self.controlling ? (available ? @"Controlling phone" : @"Connect to control the phone") : @"Hover to move · Click to select";
+    if (self.controlling) {
+        NSPoint point = self.lastPoint;
+        [NSColor.controlAccentColor setFill];
+        CGFloat radius = self.pressed ? 9 : 6;
+        [[NSBezierPath bezierPathWithOvalInRect:NSMakeRect(point.x-radius,point.y-radius,radius*2,radius*2)] fill];
+        [NSColor.labelColor setStroke];
+        NSBezierPath *cross = [NSBezierPath bezierPath];
+        [cross moveToPoint:NSMakePoint(point.x-11,point.y)]; [cross lineToPoint:NSMakePoint(point.x+11,point.y)];
+        [cross moveToPoint:NSMakePoint(point.x,point.y-11)]; [cross lineToPoint:NSMakePoint(point.x,point.y+11)]; [cross stroke];
+    }
+    [title drawAtPoint:NSMakePoint(16,28) withAttributes:@{NSFontAttributeName:[NSFont systemFontOfSize:14 weight:NSFontWeightMedium],NSForegroundColorAttributeName:NSColor.labelColor}];
+    [@"Leave to stop · Marker shows local input, not phone coordinates" drawAtPoint:NSMakePoint(16,56) withAttributes:@{NSFontAttributeName:[NSFont systemFontOfSize:12],NSForegroundColorAttributeName:NSColor.secondaryLabelColor}];
+}
+@end
+
 @implementation AnikeyApp
 - (instancetype)init {
     if ((self = [super init])) {
-        _heldKeys = [NSMutableOrderedSet orderedSet];
+        _heldKeys = [NSMutableOrderedSet orderedSet]; _motion = [PointerMotion new];
         _inputControls = [NSMutableArray array];
     }
     return self;
@@ -662,28 +835,38 @@ static uint8_t PhysicalModifiers(NSEventModifierFlags flags) {
     NSMenu *application = [[NSMenu alloc] initWithTitle:@"aniKey"];
     NSMenuItem *quit = [[NSMenuItem alloc] initWithTitle:@"Quit aniKey" action:@selector(terminate:) keyEquivalent:@"q"];
     quit.target = NSApp; [application addItem:quit]; appItem.submenu = application; NSApp.mainMenu = main;
-    self.window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0,0,620,330)
+    self.window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0,0,620,510)
         styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskClosable|NSWindowStyleMaskMiniaturizable backing:NSBackingStoreBuffered defer:NO];
-    self.window.title = @"aniKey — Bluetooth Keyboard"; self.window.delegate = self; self.window.releasedWhenClosed = NO;
+    self.window.title = @"aniKey — Bluetooth Keyboard & Mouse"; self.window.delegate = self; self.window.releasedWhenClosed = NO;
+    self.window.acceptsMouseMovedEvents = YES;
     NSView *root = self.window.contentView;
-    self.devices = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(20,270,370,32) pullsDown:NO];
+    self.devices = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(20,450,370,32) pullsDown:NO];
     self.devices.target = self; self.devices.action = @selector(selectDevice:); [root addSubview:self.devices];
-    self.refreshButton = [self button:@"Refresh" frame:NSMakeRect(398,270,82,32) in:root action:@selector(refresh:)];
-    self.connectionButton = [self button:@"Connect" frame:NSMakeRect(488,270,112,32) in:root action:@selector(connectionAction:)];
-    self.status = [self label:@"Starting Bluetooth…" frame:NSMakeRect(20,214,480,44) in:root];
-    [self button:@"Details" frame:NSMakeRect(516,220,84,28) in:root action:@selector(showDetails:)];
-    self.keyboardSurface = [[KeyboardSurface alloc] initWithFrame:NSMakeRect(20,120,580,80)]; self.keyboardSurface.owner = self;
+    self.refreshButton = [self button:@"Refresh" frame:NSMakeRect(398,450,82,32) in:root action:@selector(refresh:)];
+    self.connectionButton = [self button:@"Connect" frame:NSMakeRect(488,450,112,32) in:root action:@selector(connectionAction:)];
+    self.status = [self label:@"Starting Bluetooth…" frame:NSMakeRect(20,394,480,44) in:root];
+    [self button:@"Details" frame:NSMakeRect(516,400,84,28) in:root action:@selector(showDetails:)];
+    self.keyboardSurface = [[KeyboardSurface alloc] initWithFrame:NSMakeRect(20,300,580,80)]; self.keyboardSurface.owner = self;
     self.keyboardSurface.accessibilityElement = YES; self.keyboardSurface.accessibilityRole = NSAccessibilityGroupRole;
     self.keyboardSurface.accessibilityLabel = @"Type on your Mac keyboard"; [root addSubview:self.keyboardSurface];
     NSArray *keys = @[@"Enter",@"Tab",@"Backspace",@"Esc"];
-    for (NSUInteger i = 0; i < keys.count; i++) [self keyButton:keys[i] chord:keys[i] frame:NSMakeRect(20+i*108,68,100,34) in:root];
-    NSButton *paste = [self button:@"Type clipboard" frame:NSMakeRect(452,68,148,34) in:root action:@selector(pasteClipboard:)]; [self.inputControls addObject:paste];
+    for (NSUInteger i = 0; i < keys.count; i++) [self keyButton:keys[i] chord:keys[i] frame:NSMakeRect(20+i*108,248,100,34) in:root];
+    NSButton *paste = [self button:@"Type clipboard" frame:NSMakeRect(452,248,148,34) in:root action:@selector(pasteClipboard:)]; [self.inputControls addObject:paste];
     [self label:@"US keyboard layout · Input is sent only while connected.\nClick the typing area to use your Mac keyboard." frame:NSMakeRect(20,16,580,40) in:root];
+    self.cursorPad = [[CursorPad alloc] initWithFrame:NSMakeRect(20,100,580,130)]; self.cursorPad.owner = self;
+    self.cursorPad.accessibilityElement = YES; self.cursorPad.accessibilityRole = NSAccessibilityGroupRole;
+    self.cursorPad.accessibilityLabel = @"Phone cursor pad"; [root addSubview:self.cursorPad];
+    for (NSUInteger i = 0; i < 2; i++) {
+        NSButton *button = [self button:i ? @"Right click" : @"Left click" frame:NSMakeRect(20+i*294,56,286,32) in:root action:@selector(pointerClick:)];
+        button.tag = i ? 2 : 1; [self.inputControls addObject:button];
+    }
+    self.pointerTimer = [NSTimer scheduledTimerWithTimeInterval:1.0/60 target:self selector:@selector(flushPointer:) userInfo:nil repeats:YES];
     __weak AnikeyApp *weakSelf = self;
+
     self.eventMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown|NSEventMaskKeyUp|NSEventMaskFlagsChanged handler:^NSEvent *(NSEvent *event) {
         AnikeyApp *app = weakSelf;
         if (!app || event.window != app.window || app.window.firstResponder != app.keyboardSurface || !app.window.isKeyWindow) return event;
-        if (event.type == NSEventTypeKeyDown && event.keyCode == 0x35 && (event.modifierFlags & NSEventModifierFlagCommand) && (event.modifierFlags & NSEventModifierFlagShift)) { [app.window makeFirstResponder:nil]; return nil; }
+        if (event.type == NSEventTypeKeyDown && event.keyCode == 0x35 && (event.modifierFlags & NSEventModifierFlagCommand) && (event.modifierFlags & NSEventModifierFlagShift)) { [app resetPointer]; [app.window makeFirstResponder:nil]; return nil; }
         if (![app canSendInput]) return event;
         if (event.type == NSEventTypeFlagsChanged) [app physicalFlags:event];
         else if (!event.isARepeat) [app physicalKey:event.keyCode down:event.type == NSEventTypeKeyDown flags:event.modifierFlags];
@@ -718,19 +901,20 @@ static uint8_t PhysicalModifiers(NSEventModifierFlags flags) {
 
 - (void)refreshControls {
     BOOL enabled = [self canSendInput];
-    for (NSButton *button in self.inputControls) button.enabled = enabled;
+    for (NSButton *button in self.inputControls) button.enabled = enabled && (button.action != @selector(pointerClick:) || self.session.mouseValidated);
     self.devices.enabled = !self.connectionPending && !self.refreshingDevices;
     self.refreshButton.enabled = self.bluetoothAvailable && !self.connectionPending && !self.refreshingDevices;
     self.connectionButton.title = self.connectionPending ? (self.paused ? @"Cancelling…" : @"Cancel") :
         ((!self.paused && self.session.ready) ? @"Disconnect" : @"Connect");
     self.connectionButton.enabled = self.connectionPending ? !self.paused :
         self.bluetoothAvailable && self.selectedAddress.length > 0 && !self.refreshingDevices;
-    self.keyboardSurface.needsDisplay = YES;
+    self.keyboardSurface.needsDisplay = YES; self.cursorPad.needsDisplay = YES;
+    if (!enabled) [self resetPointer];
 }
 - (void)showDetails:(NSButton *)sender {
-    NSViewController *controller = [NSViewController new]; controller.view = [[NSView alloc] initWithFrame:NSMakeRect(0,0,380,160)];
-    NSString *details = self.session.lastError ?: [NSString stringWithFormat:@"%@ mode · Keyboard LEDs 0x%02X\nPairing alone is not a keyboard connection.",self.session.protocolMode ? @"Report" : @"Boot",self.session.LEDs];
-    [self label:details frame:NSMakeRect(16,16,348,128) in:controller.view];
+    NSViewController *controller = [NSViewController new]; controller.view = [[NSView alloc] initWithFrame:NSMakeRect(0,0,480,260)];
+    NSString *details = [NSString stringWithFormat:@"%@\n%@\n%@",self.session.mouseValidated ? @"Mouse input available." : @"Connect to enable mouse input.",self.session.mouseDiagnostic ?: @"No mouse diagnostic has run.", self.session.lastError ?: [NSString stringWithFormat:@"%@ mode · Keyboard LEDs 0x%02X\nPairing alone is not a keyboard connection.",self.session.protocolMode ? @"Report" : @"Boot",self.session.LEDs]];
+    [self label:details frame:NSMakeRect(16,16,448,228) in:controller.view];
     self.detailsPopover = [NSPopover new]; self.detailsPopover.contentViewController = controller; self.detailsPopover.behavior = NSPopoverBehaviorTransient;
     [self.detailsPopover showRelativeToRect:sender.bounds ofView:sender preferredEdge:NSRectEdgeMaxY];
 }
@@ -851,11 +1035,43 @@ static uint8_t PhysicalModifiers(NSEventModifierFlags flags) {
 }
 
 - (void)releaseInput {
+    [self resetPointer];
     self.inputEpoch++; NSUInteger generation = self.connectionGeneration;
     [self.heldKeys removeAllObjects];
     [self onTransport:^(AnikeySession *session) {
         if (generation == self.connectionGeneration && session.ready && !session.suspended) {
             [session sendReport:1 payload:KeyboardReport(0,@[])];
+            if (((const uint8_t *)session.mouse.bytes)[0]) [session sendReport:10 payload:MouseReport(0,0,0)];
+        }
+    } completion:nil];
+}
+- (void)resetPointer { self.pointerEpoch++; [self.motion reset]; [self.cursorPad reset]; }
+- (void)flushPointer:(NSTimer *)timer {
+    (void)timer; if (!self.session.mouseValidated) { [self.motion reset]; return; }
+    if (![self canSendInput]) { [self resetPointer]; return; }
+    if (self.pointerBusy) return;
+    NSData *report = [self.motion takeReport]; if (!report) return;
+    self.pointerBusy = YES; NSUInteger epoch = self.pointerEpoch;
+    [self enqueueInput:^(AnikeySession *session) {
+        if (epoch == self.pointerEpoch) [session sendReport:10 payload:report];
+    } completion:^{ self.pointerBusy = NO; }];
+}
+- (void)pointerClick:(NSButton *)sender { [self sendPointerButton:(uint8_t)sender.tag]; }
+- (void)sendPointerButton:(uint8_t)button {
+    if (!self.session.mouseValidated || ![self canSendInput] || (button != 1 && button != 2)) return;
+    // Finish movement already requested at click time before sending the click.
+    // PointerMotion is bounded, so this snapshot contains at most five packets.
+    NSMutableArray<NSData *> *movement = [NSMutableArray array]; NSData *report;
+    while ((report = [self.motion takeReport])) [movement addObject:report];
+    NSUInteger epoch = self.pointerEpoch;
+    [self enqueueInput:^(AnikeySession *session) {
+        for (NSData *motion in movement) {
+            if (epoch != self.pointerEpoch || ![session sendReport:10 payload:motion]) return;
+        }
+        if (epoch != self.pointerEpoch) return;
+        if ([session sendReport:10 payload:MouseReport(button,0,0)]) {
+            Pump(0.02);
+            [session sendReport:10 payload:MouseReport(0,0,0)];
         }
     } completion:nil];
 }
@@ -924,7 +1140,7 @@ static uint8_t PhysicalModifiers(NSEventModifierFlags flags) {
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)app {
     if (self.terminating) return NSTerminateLater;
     self.terminating = YES; self.paused = YES; self.connectionGeneration++; self.session.cancelRequested = YES;
-    [self.timer invalidate]; if (self.eventMonitor) { [NSEvent removeMonitor:self.eventMonitor]; self.eventMonitor = nil; } [self releaseInput];
+    [self.pointerTimer invalidate]; [self.timer invalidate]; if (self.eventMonitor) { [NSEvent removeMonitor:self.eventMonitor]; self.eventMonitor = nil; } [self releaseInput];
     if (!self.transport) { [self.session stop]; return NSTerminateNow; }
     [self.window orderOut:nil];
     dispatch_block_t reply = ^{
@@ -948,6 +1164,7 @@ static void Usage(void) {
          "       anikey --gui\n"
          "       anikey --help | --version\n"
          "Commands:\n"
+         "  mouse-test ACTION     One diagnostic step/click; mouse remains unavailable\n"
          "  list                  List paired devices\n"
          "  check                 Open HID channels, then close; sends no keypresses\n"
          "  pin DIGITS            Type digits, then Enter (one attempt)\n"

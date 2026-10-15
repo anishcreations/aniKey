@@ -54,7 +54,7 @@ static NSData *ParseHex(NSString *hex) {
 @end
 @implementation TestSession
 - (instancetype)init {
-    if ((self = [super init])) { self.ready = YES; self.dryRun = YES; self.keyDelayMS = 0; self.packets = [NSMutableArray array]; self.failAt = -1; }
+    if ((self = [super init])) { self.ready = YES; self.dryRun = YES; self.mouseValidated = YES; self.keyDelayMS = 0; self.packets = [NSMutableArray array]; self.failAt = -1; }
     return self;
 }
 - (BOOL)writePacket:(NSData *)packet control:(BOOL)control {
@@ -76,25 +76,39 @@ static NSData *ParseHex(NSString *hex) {
 @end
 @interface MockChannel : NSObject
 @property BluetoothL2CAPPSM PSM;
+@property BluetoothL2CAPChannelID localChannelID, remoteChannelID;
 @property (strong) IOBluetoothDevice *device;
 @property (strong) id retainedDelegate;
-@property NSUInteger closes;
+@property NSUInteger closes, delegateRegistrations;
+@property BOOL completeOnDelegate;
+@property IOReturn delegateStatus, openStatus;
 - (IOReturn)setDelegate:(id)delegate;
 - (IOReturn)closeChannel;
 @end
 @implementation MockChannel
-- (IOReturn)setDelegate:(id)delegate { self.retainedDelegate = delegate; return kIOReturnSuccess; }
+- (instancetype)init { if ((self = [super init])) { _localChannelID = 0x40; _remoteChannelID = 0x41; } return self; }
+- (IOReturn)setDelegate:(id)delegate {
+    self.retainedDelegate = delegate;
+    if (delegate) {
+        self.delegateRegistrations++;
+        if (self.completeOnDelegate && self.delegateStatus == kIOReturnSuccess)
+            [delegate l2capChannelOpenComplete:(IOBluetoothL2CAPChannel *)self status:self.openStatus];
+    }
+    return self.delegateStatus;
+}
 - (IOReturn)closeChannel { self.closes++; return kIOReturnSuccess; }
 @end
 @interface MockOpenDevice : NSObject
 @property (strong) MockChannel *channel;
 @property IOReturn result;
 @property BOOL earlyData, earlyCompletion, omitChannel;
-- (IOReturn)openL2CAPChannelSync:(IOBluetoothL2CAPChannel **)channel withPSM:(BluetoothL2CAPPSM)psm delegate:(AnikeySession *)delegate;
+@property BluetoothL2CAPPSM returnedPSM;
+- (IOReturn)openL2CAPChannelAsync:(IOBluetoothL2CAPChannel **)channel withPSM:(BluetoothL2CAPPSM)psm delegate:(AnikeySession *)delegate;
 @end
 @implementation MockOpenDevice
-- (IOReturn)openL2CAPChannelSync:(IOBluetoothL2CAPChannel **)channel withPSM:(BluetoothL2CAPPSM)psm delegate:(AnikeySession *)delegate {
-    self.channel.PSM = psm; self.channel.device = (IOBluetoothDevice *)self;
+- (IOReturn)openL2CAPChannelAsync:(IOBluetoothL2CAPChannel **)channel withPSM:(BluetoothL2CAPPSM)psm delegate:(AnikeySession *)delegate {
+    self.channel.completeOnDelegate = YES;
+    self.channel.PSM = self.returnedPSM ?: psm; self.channel.device = (IOBluetoothDevice *)self;
     self.channel.retainedDelegate = delegate;
     if (self.earlyCompletion) [delegate l2capChannelOpenComplete:(IOBluetoothL2CAPChannel *)self.channel status:kIOReturnSuccess];
     if (self.earlyData) {
@@ -117,8 +131,8 @@ static void DescriptorTests(void) {
     const uint8_t *p = ReportDescriptor().bytes;
     NSUInteger length = ReportDescriptor().length, index = 0;
     unsigned reportID = 0, size = 0, count = 0, depth = 0, usagePage = 0;
-    unsigned bits[4][3] = {{0}}; // report ID × Input/Output/Feature
-    BOOL keyboardArray = NO, modifierBits = NO, ledBits = NO;
+    unsigned bits[11][3] = {{0}}; // report ID × Input/Output/Feature
+    BOOL keyboardArray = NO, modifierBits = NO, ledBits = NO, relativeMouse = NO;
     while (index < length) {
         uint8_t header = p[index++];
         Check(header != 0xFE, @"Descriptor uses short items");
@@ -130,27 +144,30 @@ static void DescriptorTests(void) {
         unsigned type = (header >> 2) & 3, tag = header >> 4;
         if (type == 1) {
             if (tag == 0) usagePage = value;
+            Check(usagePage != 12,@"Descriptor does not advertise consumer controls");
             if (tag == 7) size = value;
-            if (tag == 8) { reportID = value; Check(reportID == 1,@"Only report ID 1 is declared"); }
+            if (tag == 8) { reportID = value; Check(reportID == 1 || reportID == 10,@"Keyboard and mouse report IDs are separate"); }
             if (tag == 9) count = value;
         } else if (type == 0) {
             if (tag == 10) depth++;
             else if (tag == 12) { Check(depth > 0,@"Collection end is balanced"); depth--; }
             else if (tag == 8 || tag == 9 || tag == 11) {
-                Check(reportID == 1, @"Main item has a report ID");
+                Check(reportID == 1 || reportID == 10, @"Main item has a report ID");
                 unsigned direction = tag == 8 ? 0 : tag == 9 ? 1 : 2;
                 bits[reportID][direction] += size*count;
                 if (reportID == 1 && direction == 0 && size == 8 && count == 6 && value == 0 && usagePage == 7) keyboardArray = YES;
                 if (reportID == 1 && direction == 0 && size == 1 && count == 8 && value == 2) modifierBits = YES;
                 if (reportID == 1 && direction == 1 && size == 1 && count == 5 && usagePage == 8) ledBits = YES;
+                if (reportID == 10 && direction == 0 && size == 8 && count == 4 && value == 6 && usagePage == 1) relativeMouse = YES;
             }
         }
     }
     Check(depth == 0,@"All collections close");
-    Check(bits[1][0] == 64 && bits[1][1] == 8 && bits[2][0] == 0 && bits[3][0] == 0,@"Only keyboard input and LEDs are advertised");
+    Check(bits[1][0] == 64 && bits[1][1] == 8 && bits[10][0] == 40 && bits[2][0] == 0,@"Keyboard, mouse and LEDs have the expected report sizes");
     Check(keyboardArray && modifierBits && ledBits,@"Descriptor defines keyboard modifiers, usages and LEDs");
+    Check(relativeMouse,@"Mouse axes are explicitly relative, not absolute or consumer usages");
     TestSession *session = [TestSession new];
-    Check(![session sendReport:2 payload:ParseHex(@"00 00 00 00")] && ![session sendReport:3 payload:ParseHex(@"00 00")] && !session.packets.count,@"Removed report IDs cannot emit packets");
+    Check(![session sendReport:10 payload:ParseHex(@"00 00 00 00")] && ![session sendReport:3 payload:ParseHex(@"00 00")] && !session.packets.count,@"Mouse rejects extra wheel bytes and consumer report IDs");
     NSDictionary *dictionary = ServiceDictionary();
     NSMutableDictionary *attributes = [NSMutableDictionary dictionary];
     for (NSString *attribute in dictionary) {
@@ -163,7 +180,7 @@ static void DescriptorTests(void) {
     // Unlike publishing, this constructor expects numeric IDs and parsed elements.
     IOBluetoothSDPServiceRecord *record = [IOBluetoothSDPServiceRecord withServiceDictionary:attributes device:nil];
     Check(record != nil,@"SDK parses local SDP record without publishing it");
-    Check([[[record getAttributeDataElement:0x0202] getNumberValue] unsignedIntValue] == 0x40,@"SDP identifies only a keyboard");
+    Check([[[record getAttributeDataElement:0x0202] getNumberValue] unsignedIntValue] == 0xC0,@"SDP identifies a keyboard and mouse");
     BluetoothL2CAPPSM psm = 0;
     IOReturn parsed = [record getL2CAPPSM:&psm];
     Check(parsed == kIOReturnSuccess && psm == 0x11,[NSString stringWithFormat:@"SDP advertises control PSM 0x11 (status=0x%08X, psm=%u, attribute=%@)",(unsigned)parsed,psm,[record getAttributeDataElement:4]]);
@@ -176,10 +193,73 @@ static void DescriptorTests(void) {
     Check([[entry[0] getNumberValue] intValue] == 0x22,@"SDP uses report descriptor type 0x22");
     Check([[(IOBluetoothSDPDataElement *)entry[1] getValue] isEqual:ReportDescriptor()],@"SDP preserves binary descriptor bytes as a text-string element");
     Check(ServiceHasExpectedDescriptor(record),@"Publication guard accepts the exact advertised layout");
+    Check(ServiceValidationError(record) == nil,@"Full local SDP validation accepts correct endpoints and descriptor");
+    NSDictionary *original = [attributes copy];
+    attributes[@4] = [IOBluetoothSDPDataElement withElementValue:@[@[SDPUUID(0x0100),SDPNumber(0x1001,2)],@[SDPUUID(0x0011)]]];
+    record = [IOBluetoothSDPServiceRecord withServiceDictionary:attributes device:nil];
+    Check([ServiceValidationError(record) containsString:@"control PSM"],@"Remapped control PSM is rejected");
+    [attributes setDictionary:original];
+    attributes[@0x000D] = [IOBluetoothSDPDataElement withElementValue:@[@[@[SDPUUID(0x0100),SDPNumber(0x1003,2)],@[SDPUUID(0x0011)]]]];
+    record = [IOBluetoothSDPServiceRecord withServiceDictionary:attributes device:nil];
+    Check([ServiceValidationError(record) containsString:@"interrupt PSM"],@"Remapped interrupt PSM is rejected");
+    [attributes removeObjectForKey:@0x000D];
+    record = [IOBluetoothSDPServiceRecord withServiceDictionary:attributes device:nil];
+    Check([ServiceValidationError(record) containsString:@"malformed"],@"Missing interrupt endpoint is rejected");
+    [attributes setDictionary:original];
+    attributes[@0x000D] = [IOBluetoothSDPDataElement withElementValue:@[@[@[SDPUUID(0x0100),SDPNumber(0x13,2)],@[SDPUUID(0x9999)]]]];
+    record = [IOBluetoothSDPServiceRecord withServiceDictionary:attributes device:nil];
+    Check([ServiceValidationError(record) containsString:@"malformed"],@"Wrong interrupt protocol UUID is rejected");
+    [attributes setDictionary:original];
     attributes[@0x0206] = [IOBluetoothSDPDataElement withElementValue:@[@[SDPNumber(0x22,1),@{@"DataElementType":@4,@"DataElementValue":ParseHex(@"05 0C") }]]];
     record = [IOBluetoothSDPServiceRecord withServiceDictionary:attributes device:nil];
     Check(!ServiceHasExpectedDescriptor(record),@"Publication guard rejects a different consumer-only layout");
+    Check([ServiceValidationError(record) containsString:@"descriptor mismatch"],@"Descriptor mismatch blocks the transport");
     Check(!ServiceHasExpectedDescriptor(nil),@"Publication guard rejects a missing record");
+}
+
+static void MouseTests(void) {
+    AnikeySession *blocked = [AnikeySession new]; blocked.ready = YES; blocked.dryRun = YES;
+    Check(!blocked.mouseValidated && ![blocked sendReport:10 payload:MouseReport(0,1,0)],@"Production mouse output is blocked by default");
+    Check([blocked.mouseDiagnostic containsString:@"blocked"] && [blocked.mouseDiagnostic containsString:@"PSM=0x0013"],@"Blocked mouse diagnostic names the endpoint without keyboard content");
+    blocked.lastError = nil;
+    Check([blocked tap:(Key){4,0}],@"Keyboard remains available while mouse is blocked");
+    TestSession *probe = [TestSession new]; probe.mouseValidated = NO;
+    Check([probe probeMouse:@"right"],@"An explicit diagnostic can send one bounded movement step");
+    Expect(probe,0,NO,@"A1 0A 00 01 00 00 00");
+    Check(!probe.mouseProbeRemaining && !probe.mouseValidated,@"Probe cannot leave continuous mouse input enabled");
+    Check(![probe sendReport:10 payload:MouseReport(0,50,0)] && probe.packets.count == 1,@"Further movement is blocked after probe budget expires");
+    probe.lastError = nil; [probe.packets removeAllObjects];
+    Check([probe probeMouse:@"left-click"],@"Explicit click test sends only a press and release");
+    Expect(probe,0,NO,@"A1 0A 01 00 00 00 00"); Expect(probe,1,NO,@"A1 0A 00 00 00 00 00");
+    NSString *diagnostic = probe.mouseDiagnostic;
+    Check([diagnostic containsString:@"report=10"] && [diagnostic containsString:@"payload=5"] && [diagnostic containsString:@"wire=7"] && [diagnostic containsString:@"mode=report"] && [diagnostic containsString:@"channel=interrupt"],@"Mouse diagnostic includes framing, protocol and channel");
+    [probe tap:(Key){0x04,0}]; Check([probe.mouseDiagnostic isEqual:diagnostic],@"Keyboard input never enters mouse diagnostics");
+    Check(![probe sendReport:2 payload:MouseReport(0,1,0)],@"Report-mode mouse can never be transmitted as consumer report ID 2");
+    probe.mouseValidated = YES;
+    for (NSString *invalid in @[@"04 00 00 00 00",@"00 80 00 00 00",@"00 00 00 01 00",@"00 00 00 00 01"])
+        Check(![probe sendReport:10 payload:ParseHex(invalid)],@"Invalid buttons, out-of-range axes and nonzero extra axes are rejected");
+    PointerMotion *motion = [PointerMotion new];
+    [motion addX:0.4 y:-0.4]; Check(![motion takeReport],@"Fractional points are accumulated");
+    [motion addX:0.8 y:-0.8]; Check([[motion takeReport] isEqual:ParseHex(@"00 01 FF 00 00")],@"Signed movement preserves subpixel remainder");
+    [motion reset]; [motion addX:300 y:-260];
+    Check([[motion takeReport] isEqual:ParseHex(@"00 7F 81 00 00")],@"Large movement splits into legal signed deltas");
+    Check([[motion takeReport] isEqual:ParseHex(@"00 7F 81 00 00")],@"Large movement is not wrapped");
+    Check([[motion takeReport] isEqual:ParseHex(@"00 2E FA 00 00")] && ![motion takeReport],@"Remaining motion is preserved exactly");
+    [motion addX:NAN y:INFINITY]; Check(![motion takeReport],@"Invalid motion is ignored");
+    [motion addX:100000 y:-100000]; Check(motion.x == 512 && motion.y == -512,@"Pending motion is bounded");
+    [motion reset]; Check(![motion takeReport],@"Reset discards pending motion");
+    TestSession *session = [TestSession new];
+    Check([session sendReport:10 payload:MouseReport(0,-127,127)],@"Mouse input sends signed relative values");
+    Expect(session,0,NO,@"A1 0A 00 81 7F 00 00");
+    [session handlePacket:ParseHex(@"41 0A") control:YES]; Expect(session,1,YES,@"A1 0A 00 00 00 00 00");
+    [session handlePacket:ParseHex(@"70") control:YES];
+    Check([session sendReport:10 payload:MouseReport(1,0,0)],@"Boot protocol uses the required three-byte ID-2 report");
+    Expect(session,3,NO,@"A1 02 01 00 00");
+    [session stop]; Expect(session,4,NO,@"A1 02 00 00 00");
+    session = [TestSession new]; session.suspended = YES;
+    Check(![session sendReport:10 payload:MouseReport(0,1,1)] && !session.packets.count,@"Suspended mouse input is rejected");
+    session.suspended = NO; session.ready = NO;
+    Check(![session sendReport:10 payload:MouseReport(0,1,1)] && !session.packets.count,@"Offline mouse input is rejected");
 }
 
 static void InputTests(void) {
@@ -219,7 +299,7 @@ static void ProtocolTests(void) {
     Check(session.protocolMode == 0,@"Host can select boot mode");
     Check([session tap:(Key){0x28,0}],@"Boot keyboard works");
     Expect(session,2,NO,@"A1 01 00 00 28 00 00 00 00 00");
-    [session handlePacket:ParseHex(@"41 02") control:YES]; Expect(session,4,YES,@"02");
+    [session handlePacket:ParseHex(@"41 02") control:YES]; Expect(session,4,YES,@"A1 02 00 00 00");
     [session handlePacket:ParseHex(@"41 03") control:YES]; Expect(session,5,YES,@"02");
     [session handlePacket:ParseHex(@"71") control:YES]; Expect(session,6,YES,@"00");
     [session handlePacket:ParseHex(@"52 01 07") control:YES]; Expect(session,7,YES,@"00");
@@ -300,6 +380,7 @@ static void ConnectionLifecycleTests(void) {
     device.channel = [MockChannel new]; device.result = kIOReturnSuccess; device.earlyData = YES;
     Check([session openPSM:0x11],@"Successful open with data dispatched before return works");
     Expect(session,0,YES,@"A0 01");
+    Check(device.channel.delegateRegistrations == 1,@"Async submission explicitly registers its delegate to start the modern bridge");
     Check(session.control == (IOBluetoothL2CAPChannel *)device.channel && !session.ready,@"Early control messages can be answered without enabling input prematurely");
     ServiceRemovalSpy *service = [ServiceRemovalSpy new]; session.service = (IOBluetoothSDPServiceRecord *)service;
     [session disconnect];
@@ -313,6 +394,20 @@ static void ConnectionLifecycleTests(void) {
     Check(![session openPSM:0x13] && device.channel.closes == 1 && !session.interrupt,@"Failure after an early completion cleans up the adopted channel exactly once");
     device.channel = [MockChannel new]; device.result = kIOReturnSuccess; device.omitChannel = YES;
     Check(![session openPSM:0x11] && device.channel.closes == 1,@"Success status without a returned channel cleans up early ownership and fails");
+    [session stop];
+    session = [TestSession new]; session.ready = NO; session.connecting = YES;
+    device = [MockOpenDevice new]; device.channel = [MockChannel new]; device.result = kIOReturnSuccess; device.returnedPSM = 0x1001;
+    session.device = (IOBluetoothDevice *)device;
+    Check(![session openPSM:0x11] && !session.control && device.channel.closes == 1,@"A successful SDK call on the wrong PSM is closed and blocked");
+    device.returnedPSM = 0; device.channel = [MockChannel new]; device.channel.localChannelID = 0;
+    Check([session openPSM:0x11] && session.control && device.channel.closes == 0,@"Zero legacy CIDs do not invalidate a successful matching-PSM open");
+    [session stop];
+    session = [TestSession new]; session.ready = NO; session.connecting = YES;
+    device = [MockOpenDevice new]; device.channel = [MockChannel new]; device.result = kIOReturnSuccess;
+    device.channel.delegateStatus = kIOReturnNotPermitted; session.device = (IOBluetoothDevice *)device;
+    Check(![session openPSM:0x11] && !session.control && device.channel.closes == 1,@"Delegate registration failure closes the submitted channel");
+    device.channel = [MockChannel new]; device.channel.openStatus = kIOReturnNotOpen;
+    Check(![session openPSM:0x11] && !session.control && device.channel.closes == 1,@"Failed open callback blocks input despite successful submission");
     [session stop];
     NSString *status = ConnectionFailureStatus(@"Opening control PSM 0x0011: IOReturn 0xE00002BC");
     Check([status containsString:@"control PSM 0x0011"] && [status containsString:@"0xE00002BC"] && [status containsString:@"Press Connect"],@"Main failure status exposes the stage and points to manual Connect");
@@ -353,6 +448,35 @@ static void WorkerTests(void) {
     [app onTransport:^(AnikeySession *transport) { [transport stop]; [app.transport finish]; } completion:nil];
     while (app.transport.thread && NSProcessInfo.processInfo.systemUptime < deadline) Pump(0.01);
     Check(!app.transport.thread,@"Packet worker closes without retaining a background thread");
+
+    app = [SmokeApp new]; session = [SlowWriteSession new]; app.session = session;
+    app.transport = [TransportWorker new];
+    [app.transport perform:^{ Pump(0.1); }];
+    for (unsigned i = 0; i < 100; i++) { [app.motion addX:1 y:1]; [app flushPointer:nil]; }
+    Check(app.pointerBusy && app.motion.x == 99,@"High-rate movement coalesces behind at most one pending transport operation");
+    [app resetPointer]; finished = NO;
+    [app onTransport:^(AnikeySession *transport) { (void)transport; } completion:^{ finished = YES; }];
+    deadline = NSProcessInfo.processInfo.systemUptime+2;
+    while (!finished && NSProcessInfo.processInfo.systemUptime < deadline) Pump(0.005);
+    Check(finished && !app.pointerBusy && !session.packets.count,@"Pad exit cancels queued motion before it reaches the wire");
+    [app.transport perform:^{ Pump(0.1); }];
+    [app.motion addX:50 y:50]; [app sendPointerButton:1]; [app resetPointer]; finished = NO;
+    [app onTransport:^(AnikeySession *transport) { (void)transport; } completion:^{ finished = YES; }];
+    while (!finished && NSProcessInfo.processInfo.systemUptime < deadline) Pump(0.005);
+    Check(finished && !session.packets.count,@"Pad exit discards motion and click snapshots waiting behind a blocked operation");
+    [app.motion addX:20 y:-10]; [app flushPointer:nil];
+    while (!session.enteredWrite && NSProcessInfo.processInfo.systemUptime < deadline) Pump(0.005);
+    Check(session.enteredWrite && !session.writeOnMain,@"Mouse writes stay off AppKit even when blocked");
+    for (unsigned i = 0; i < 100; i++) { [app.motion addX:1 y:1]; [app flushPointer:nil]; }
+    [app releaseInput]; finished = NO;
+    [app onTransport:^(AnikeySession *transport) { (void)transport; } completion:^{ finished = YES; }];
+    while (!finished && NSProcessInfo.processInfo.systemUptime < deadline) Pump(0.005);
+    Check(finished && session.packets.count == 2 && app.motion.x == 0,@"Focus loss discards accumulated motion behind a slow write");
+    Expect(session,0,NO,@"A1 0A 00 14 F6 00 00");
+    Expect(session,1,NO,@"A1 01 00 00 00 00 00 00 00 00");
+    [app onTransport:^(AnikeySession *transport) { [transport stop]; [app.transport finish]; } completion:nil];
+    while (app.transport.thread && NSProcessInfo.processInfo.systemUptime < deadline) Pump(0.005);
+    Check(!app.transport.thread,@"Pointer worker shuts down cleanly");
 }
 static void ResponsiveConnectionTest(void) {
     SmokeApp *app = [SmokeApp new]; SlowTestSession *session = [SlowTestSession new]; session.ready = NO; app.session = session;
@@ -411,7 +535,8 @@ static void UISmokeTest(NSString *destination) {
     Check(app.window.visible && app.devices.numberOfItems == 1,@"Native window opens with device picker");
     Check(app.window.firstResponder == app.keyboardSurface && app.keyboardSurface.acceptsFirstResponder,@"Native keyboard area receives focus without a Send button");
     Check([app.window.title containsString:@"Bluetooth Keyboard"] && NSApp.mainMenu.numberOfItems >= 1,@"Keyboard title and native Quit menu exist");
-    Check(app.inputControls.count == 5,@"Only four basic keys and clipboard typing appear");
+    Check(app.inputControls.count == 7,@"Keyboard controls and two explicit mouse buttons appear");
+    [app.pointerTimer invalidate];
     Check(session.connectCount == 0 && app.connectionButton.enabled,@"Startup stays idle with manual Connect");
     [app.connectionButton performClick:nil];
     Check(session.ready && session.connectCount == 1 && [app.connectionButton.title isEqual:@"Disconnect"],@"Connect performs exactly one attempt");
@@ -458,7 +583,41 @@ static void UISmokeTest(NSString *destination) {
     while ((!drained || app.transport.thread) && NSProcessInfo.processInfo.systemUptime < deadline) Pump(0.005);
     Check(drained && !app.transport.thread,@"Native key button worker shuts down");
     app.transport = nil;
+    [session.packets removeAllObjects];
+    NSPoint start = [app.cursorPad convertPoint:NSMakePoint(20,20) toView:nil];
+    NSPoint end = [app.cursorPad convertPoint:NSMakePoint(50,40) toView:nil];
+    NSEvent *press = [NSEvent mouseEventWithType:NSEventTypeLeftMouseDown location:start modifierFlags:0 timestamp:0 windowNumber:app.window.windowNumber context:nil eventNumber:0 clickCount:1 pressure:1];
+    NSEvent *move = [NSEvent mouseEventWithType:NSEventTypeMouseMoved location:end modifierFlags:0 timestamp:0 windowNumber:app.window.windowNumber context:nil eventNumber:1 clickCount:0 pressure:0];
+    [app.cursorPad mouseMoved:move];
+    Check(app.motion.x == 0 && app.motion.y == 0,@"Pad does not send motion before activation");
+    session.mouseValidated = NO; [app refreshControls];
+    [app.cursorPad mouseDown:press]; [app.cursorPad mouseDragged:move]; [app flushPointer:nil];
+    Check(app.cursorPad.controlling && NSEqualPoints(app.cursorPad.lastPoint,NSMakePoint(50,40)),@"Local marker follows the drag during preview");
+    Check(!session.packets.count && app.motion.x == 0,@"Preview never transmits movement");
+    Check(!app.inputControls[5].enabled && !app.inputControls[6].enabled,@"Unvalidated mouse buttons are disabled");
+    [app pointerClick:app.inputControls[5]]; Check(!session.packets.count,@"Calling click action cannot bypass validation");
+    [app.cursorPad mouseUp:press]; Check(app.cursorPad.controlling && !app.cursorPad.pressed,@"Mouse release clears click feedback while hover stays active");
+    session.mouseValidated = YES; [app refreshControls]; // Test fixture only, never a production setting.
+    [app resetPointer]; [app.cursorPad mouseEntered:press];
+    Check(app.motion.x == 0,@"Entering the pad establishes an origin without a jump");
+    [app.cursorPad mouseMoved:move]; [app.cursorPad scrollWheel:move]; [app flushPointer:nil];
+    Expect(session,0,NO,@"A1 0A 00 1E 14 00 00");
+    [app.cursorPad mouseDown:move]; [app.cursorPad mouseUp:move];
+    Expect(session,1,NO,@"A1 0A 01 00 00 00 00"); Expect(session,2,NO,@"A1 0A 00 00 00 00 00");
+    Check(session.packets.count == 3 && app.cursorPad.controlling && !app.cursorPad.pressed,@"Clicking the pad taps the mouse once without holding a remote drag");
+    [app.inputControls[5] performClick:nil];
+    Expect(session,3,NO,@"A1 0A 01 00 00 00 00"); Expect(session,4,NO,@"A1 0A 00 00 00 00 00");
+    [app.inputControls[6] performClick:nil];
+    Expect(session,5,NO,@"A1 0A 02 00 00 00 00"); Expect(session,6,NO,@"A1 0A 00 00 00 00 00");
+    [app.motion addX:12 y:-6]; [app sendPointerButton:1];
+    Expect(session,7,NO,@"A1 0A 00 0C FA 00 00");
+    Expect(session,8,NO,@"A1 0A 01 00 00 00 00"); Expect(session,9,NO,@"A1 0A 00 00 00 00 00");
+    Check(app.motion.x == 0,@"A pad click finishes pending movement before pressing the mouse button");
+    [app.motion addX:60 y:-40]; [app.cursorPad mouseExited:move]; [app flushPointer:nil];
+    Check(!app.cursorPad.controlling && app.motion.x == 0 && session.packets.count == 10,@"Leaving the pad discards remaining motion");
+    [app releaseInput];
     CheckBounds(app.window.contentView);
+
     [app.connectionButton performClick:nil];
     Check(!session.ready && [app.connectionButton.title isEqual:@"Connect"],@"Disconnect returns to idle");
     NSUInteger count = session.packets.count;
@@ -468,12 +627,12 @@ static void UISmokeTest(NSString *destination) {
     NSBitmapImageRep *bitmap = [view bitmapImageRepForCachingDisplayInRect:view.bounds];
     [view cacheDisplayInRect:view.bounds toBitmapImageRep:bitmap];
     Check([[bitmap representationUsingType:NSBitmapImageFileTypePNG properties:@{}] writeToFile:destination atomically:YES],@"Native window render saved");
-    [app.timer invalidate]; [NSEvent removeMonitor:app.eventMonitor]; [app.session stop]; [app.window orderOut:nil];
+    [app.pointerTimer invalidate]; [app.timer invalidate]; [NSEvent removeMonitor:app.eventMonitor]; [app.session stop]; [app.window orderOut:nil];
 }
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
         if (argc == 3 && strcmp(argv[1],"--ui-smoke") == 0) { UISmokeTest(@(argv[2])); ResponsiveConnectionTest(); BoundedQuitTest(); }
-        else { DescriptorTests(); InputTests(); ProtocolTests(); ForwardingTests(); ConnectionLifecycleTests(); WorkerTests(); }
+        else { DescriptorTests(); MouseTests(); InputTests(); ProtocolTests(); ForwardingTests(); ConnectionLifecycleTests(); WorkerTests(); }
         printf("PASS: %u checks (no Bluetooth accessed)\n",Checks);
     }
     return 0;

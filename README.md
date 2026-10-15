@@ -1,6 +1,6 @@
 # aniKey
 
-**A native Bluetooth keyboard for macOS.** Use your Mac keyboard to type on an Android phone over Classic Bluetooth HID, with a compact desktop interface and a command-line tool.
+**A native Bluetooth keyboard and mouse for macOS.** Type on an Android phone and control its pointer over Classic Bluetooth HID, with a compact desktop interface and keyboard command-line tools.
 
 Version **0.1.0 (unreleased)** · macOS 13+ · GPL-3.0-or-later
 
@@ -9,6 +9,7 @@ Version **0.1.0 (unreleased)** · macOS 13+ · GPL-3.0-or-later
 - Mac keyboard input: letters, numbers, punctuation, modifiers, arrows, and function keys.
 - Enter, Tab, Backspace, and Escape buttons.
 - Clipboard text entry.
+- Phone cursor movement with a hover pad and left/right clicks.
 - Device picker and Connect, Cancel, and Disconnect controls.
 - CLI text and key commands with configurable timing and dry-run output.
 
@@ -32,6 +33,12 @@ The build produces `build/aniKey.app` and `build/anikey`.
 3. After **Input connected** appears, click the typing area and use your Mac keyboard.
 
 Allow Bluetooth access on macOS when prompted. Input goes to the phone's active field or screen. **Type clipboard** enters plain text from the Mac clipboard. **⌘⇧Esc** returns keyboard focus to the Mac; **⌘** acts as **Ctrl** during keyboard forwarding.
+
+## Phone cursor
+
+While connected, move over the pad to move the phone pointer. Click the pad for a left click, or use **Left click** and **Right click**. Leaving the pad or switching away stops movement. The local marker shows your Mac input, not the phone pointer's exact position.
+
+Scrolling and dragging items on the phone are not included.
 
 ## Command line
 

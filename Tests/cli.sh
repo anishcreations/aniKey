@@ -19,6 +19,23 @@ diff -u "$tmp/expected" "$tmp/app-version"
 "$binary" --help > "$tmp/help"
 /usr/bin/grep -q -- '--version' "$tmp/help"
 
+for direction in left right up down; do
+    case "$direction" in
+        left) delta='FF 00' ;;
+        right) delta='01 00' ;;
+        up) delta='00 FF' ;;
+        down) delta='00 01' ;;
+    esac
+    "$binary" --dry-run mouse-test "$direction" > "$tmp/probe" 2> "$tmp/diagnostic"
+    printf '%s\n' "INTERRUPT A1 0A 00 $delta 00 00" > "$tmp/expected-probe"
+    diff -u "$tmp/expected-probe" "$tmp/probe"
+    /usr/bin/grep -q 'report=10 payload=5 wire=7' "$tmp/diagnostic"
+    /usr/bin/grep -q 'channel=interrupt PSM=0x0013' "$tmp/diagnostic"
+done
+"$binary" --dry-run mouse-test left-click > "$tmp/probe" 2> "$tmp/diagnostic"
+printf '%s\n' 'INTERRUPT A1 0A 01 00 00 00 00' 'INTERRUPT A1 0A 00 00 00 00 00' > "$tmp/expected-probe"
+diff -u "$tmp/expected-probe" "$tmp/probe"
+
 "$binary" --dry-run --delay-ms 0 text 'Hello' > "$tmp/text"
 cat > "$tmp/expected" <<'EOF'
 INTERRUPT A1 01 02 00 0B 00 00 00 00 00
@@ -92,6 +109,9 @@ bad --dry-run nav home
 bad --dry-run mouse 1junk 0
 bad --dry-run key ctrl+unknown
 bad --dry-run key F13
+bad --dry-run mouse-test
+bad --dry-run mouse-test volume
+bad --dry-run mouse-test right extra
 bad --dry-run key hyper+a
 bad --dry-run text
 bad --dry-run text Hello extra

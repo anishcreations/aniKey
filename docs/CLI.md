@@ -9,6 +9,8 @@ anikey --version
 
 Use `./build/anikey` when running from the repository. Options come before the command. The device address accepts colon-separated, hyphen-separated, or twelve contiguous hexadecimal digits. `--device` is required for input commands and `check`, except in dry-run mode.
 
+The native window provides keyboard input, a hover pad for the phone cursor, and left/right mouse clicks.
+
 ## Commands
 
 | Command | Behavior |
@@ -36,3 +38,17 @@ Named keys include `enter`, `esc`/`escape`, `backspace`, `tab`, `space`, `capslo
 | `2` | Invalid arguments |
 
 Errors are printed to standard error. Unsupported text is rejected before any characters are sent.
+
+## Mouse diagnostics
+
+`mouse-test ACTION` performs one explicit diagnostic operation. Valid actions are `left`, `right`, `up`, `down`, `left-click`, and `right-click`. A direction sends one button-free HID mouse report with a one-unit relative delta. A click sends a press and release pair. Each invocation then closes its session; it never enables continuous mouse control.
+
+Inspect packets without touching Bluetooth:
+
+```sh
+./build/anikey --dry-run mouse-test right
+```
+
+A real-device test uses `--device ADDRESS` instead of `--dry-run` and sends actual phone input. Run a single direction first while watching the phone. Stop testing if it changes system controls rather than moving a visible cursor. Click tests are intended only after directional mouse recognition works.
+
+Mouse diagnostics go to standard error and include report ID, payload/wire sizes, HIDP header, protocol mode, channel PSM, button bits, and relative deltas. They do not include keyboard input. Local descriptor and channel checks do not establish how Android interpreted the service.

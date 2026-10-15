@@ -11,7 +11,7 @@
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSBluetoothAlwaysUsageDescription</key>
-    <string>aniKey uses Bluetooth to send keyboard input to your selected paired device.</string>
+    <string>aniKey uses Bluetooth to send keyboard and mouse input to your selected paired device.</string>
     <key>NSBluetoothPeripheralUsageDescription</key>
-    <string>aniKey publishes a Classic Bluetooth keyboard service for your device.</string>
+    <string>aniKey publishes a Classic Bluetooth keyboard and mouse service for your device.</string>
 </dict></plist>
