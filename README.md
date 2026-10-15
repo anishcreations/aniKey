@@ -9,7 +9,10 @@ Version **0.1.0 (unreleased)** · macOS 13+ · GPL-3.0-or-later
 - Mac keyboard input: letters, numbers, punctuation, modifiers, arrows, and function keys.
 - Enter, Tab, Backspace, and Escape buttons.
 - Clipboard text entry.
-- Phone cursor movement with a hover pad and left/right clicks.
+- Phone cursor movement, tapping, and click-and-hold dragging through the pad.
+- Two-finger scrolling and sideways swipes for Android Back, anywhere on the pad.
+- Back, Home, and Recents buttons; three-finger gestures stay with macOS.
+- Adjustable pad size and a resizable window.
 - Device picker and Connect, Cancel, and Disconnect controls.
 - CLI text and key commands with configurable timing and dry-run output.
 
@@ -36,9 +39,23 @@ Allow Bluetooth access on macOS when prompted. Input goes to the phone's active 
 
 ## Phone cursor
 
-While connected, move over the pad to move the phone pointer. Click the pad for a left click, or use **Left click** and **Right click**. Leaving the pad or switching away stops movement. The local marker shows your Mac input, not the phone pointer's exact position.
+While connected, move over the pad to position the phone pointer. **Click and release to tap. Hold the click, slide, then release to drag or swipe in an Android app.** The phone's primary mouse button stays held throughout the slide. A secondary click on the pad sends the secondary mouse button; its effect depends on the Android app. Separate Left/Right click buttons are unnecessary.
 
-Scrolling and dragging items on the phone are not included.
+The local marker shows your Mac input, not the phone pointer's exact position.
+
+Keep the Mac pointer over the pad. Gestures work anywhere inside it:
+
+| Gesture | Action |
+| --- | --- |
+| Two fingers up/down | Scroll the content under the phone pointer |
+| Two fingers sideways, either direction | Back, once when the fingers lift |
+| Mouse wheel | Scroll vertically |
+
+Use **Pad size** to change the area; aniKey remembers the setting. You can also resize the window. Leaving the pad, switching away, or cancelling a gesture discards pending movement and scrolling. Scroll momentum is not forwarded.
+
+Use **Back**, **Home**, and **Recents** for system navigation. Three-finger gestures are ignored by aniKey, so macOS can keep using them. Recents sends a Windows/Meta+Tab keyboard shortcut; phone firmware may customize shortcut behavior.
+
+These controls send Bluetooth mouse and keyboard input. An app must support mouse dragging for a click-and-slide to act like a finger swipe. Android's touchscreen edge gestures and pinch-to-zoom require a different input mode; moving the mouse upward alone does not trigger Home.
 
 ## Command line
 

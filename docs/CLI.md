@@ -9,7 +9,7 @@ anikey --version
 
 Use `./build/anikey` when running from the repository. Options come before the command. The device address accepts colon-separated, hyphen-separated, or twelve contiguous hexadecimal digits. `--device` is required for input commands and `check`, except in dry-run mode.
 
-The native window provides keyboard input, a hover pad for the phone cursor, and left/right mouse clicks.
+The native window provides keyboard input, an adjustable pointer pad with click-and-hold dragging and secondary clicks, two-finger scrolling and Back gestures, and Back/Home/Recents buttons. Three-finger gestures are left to macOS. These pad controls are GUI features; CLI commands remain listed below.
 
 ## Commands
 

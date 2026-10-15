@@ -144,15 +144,16 @@ static void DescriptorTests(void) {
         unsigned type = (header >> 2) & 3, tag = header >> 4;
         if (type == 1) {
             if (tag == 0) usagePage = value;
-            Check(usagePage != 12,@"Descriptor does not advertise consumer controls");
             if (tag == 7) size = value;
-            if (tag == 8) { reportID = value; Check(reportID == 1 || reportID == 10,@"Keyboard and mouse report IDs are separate"); }
+            if (tag == 8) { reportID = value; Check(reportID == 1 || reportID == 2 || reportID == 10,@"Keyboard, navigation and mouse report IDs are separate"); }
             if (tag == 9) count = value;
+        } else if (type == 2 && tag == 0 && usagePage == 12) {
+            Check(value == 1 || value == 0x0224 || value == 0x0223,@"Consumer collection exposes only Back and Home usages");
         } else if (type == 0) {
             if (tag == 10) depth++;
             else if (tag == 12) { Check(depth > 0,@"Collection end is balanced"); depth--; }
             else if (tag == 8 || tag == 9 || tag == 11) {
-                Check(reportID == 1 || reportID == 10, @"Main item has a report ID");
+                Check(reportID == 1 || reportID == 2 || reportID == 10, @"Main item has a report ID");
                 unsigned direction = tag == 8 ? 0 : tag == 9 ? 1 : 2;
                 bits[reportID][direction] += size*count;
                 if (reportID == 1 && direction == 0 && size == 8 && count == 6 && value == 0 && usagePage == 7) keyboardArray = YES;
@@ -163,11 +164,11 @@ static void DescriptorTests(void) {
         }
     }
     Check(depth == 0,@"All collections close");
-    Check(bits[1][0] == 64 && bits[1][1] == 8 && bits[10][0] == 40 && bits[2][0] == 0,@"Keyboard, mouse and LEDs have the expected report sizes");
+    Check(bits[1][0] == 64 && bits[1][1] == 8 && bits[10][0] == 40 && bits[2][0] == 16,@"Keyboard, mouse, navigation and LEDs have the expected report sizes");
     Check(keyboardArray && modifierBits && ledBits,@"Descriptor defines keyboard modifiers, usages and LEDs");
     Check(relativeMouse,@"Mouse axes are explicitly relative, not absolute or consumer usages");
     TestSession *session = [TestSession new];
-    Check(![session sendReport:10 payload:ParseHex(@"00 00 00 00")] && ![session sendReport:3 payload:ParseHex(@"00 00")] && !session.packets.count,@"Mouse rejects extra wheel bytes and consumer report IDs");
+    Check(![session sendReport:10 payload:ParseHex(@"00 00 00 00")] && ![session sendReport:3 payload:ParseHex(@"00 00")] && !session.packets.count,@"Mouse rejects malformed lengths and unadvertised report IDs");
     NSDictionary *dictionary = ServiceDictionary();
     NSMutableDictionary *attributes = [NSMutableDictionary dictionary];
     for (NSString *attribute in dictionary) {
@@ -236,8 +237,8 @@ static void MouseTests(void) {
     [probe tap:(Key){0x04,0}]; Check([probe.mouseDiagnostic isEqual:diagnostic],@"Keyboard input never enters mouse diagnostics");
     Check(![probe sendReport:2 payload:MouseReport(0,1,0)],@"Report-mode mouse can never be transmitted as consumer report ID 2");
     probe.mouseValidated = YES;
-    for (NSString *invalid in @[@"04 00 00 00 00",@"00 80 00 00 00",@"00 00 00 01 00",@"00 00 00 00 01"])
-        Check(![probe sendReport:10 payload:ParseHex(invalid)],@"Invalid buttons, out-of-range axes and nonzero extra axes are rejected");
+    for (NSString *invalid in @[@"04 00 00 00 00",@"00 80 00 00 00",@"00 00 00 01 00",@"00 00 00 00 80"])
+        Check(![probe sendReport:10 payload:ParseHex(invalid)],@"Invalid buttons, reserved Z and out-of-range axes/wheel are rejected");
     PointerMotion *motion = [PointerMotion new];
     [motion addX:0.4 y:-0.4]; Check(![motion takeReport],@"Fractional points are accumulated");
     [motion addX:0.8 y:-0.8]; Check([[motion takeReport] isEqual:ParseHex(@"00 01 FF 00 00")],@"Signed movement preserves subpixel remainder");
@@ -248,6 +249,11 @@ static void MouseTests(void) {
     [motion addX:NAN y:INFINITY]; Check(![motion takeReport],@"Invalid motion is ignored");
     [motion addX:100000 y:-100000]; Check(motion.x == 512 && motion.y == -512,@"Pending motion is bounded");
     [motion reset]; Check(![motion takeReport],@"Reset discards pending motion");
+    [motion addWheel:0.4]; Check(![motion takeReport],@"Small scroll deltas retain fractions");
+    [motion addWheel:1.8]; Check([[motion takeReport] isEqual:ParseHex(@"00 00 00 00 02")],@"Scrolling sets only the wheel byte");
+    [motion reset]; [motion addWheel:-1000];
+    Check(motion.wheel == -32 && [[motion takeReport] isEqual:ParseHex(@"00 00 00 00 F8")],@"Scroll backlog and packet size are bounded");
+    [motion reset]; Check(![motion takeReport],@"Cancellation discards pending scrolling");
     TestSession *session = [TestSession new];
     Check([session sendReport:10 payload:MouseReport(0,-127,127)],@"Mouse input sends signed relative values");
     Expect(session,0,NO,@"A1 0A 00 81 7F 00 00");
@@ -256,10 +262,44 @@ static void MouseTests(void) {
     Check([session sendReport:10 payload:MouseReport(1,0,0)],@"Boot protocol uses the required three-byte ID-2 report");
     Expect(session,3,NO,@"A1 02 01 00 00");
     [session stop]; Expect(session,4,NO,@"A1 02 00 00 00");
+    session = [TestSession new];
+    Check([session sendReport:10 payload:MouseWheelReport(0,0,0,-2)],@"Vertical scrolling uses the existing mouse ID and payload");
+    Expect(session,0,NO,@"A1 0A 00 00 00 00 FE");
+    [session handlePacket:ParseHex(@"41 0A") control:YES]; Expect(session,1,YES,@"A1 0A 00 00 00 00 00");
+    session.protocolMode = 0;
+    Check(![session sendReport:10 payload:MouseWheelReport(0,0,0,1)] && session.packets.count == 2,@"Boot protocol cannot silently discard wheel bytes");
     session = [TestSession new]; session.suspended = YES;
     Check(![session sendReport:10 payload:MouseReport(0,1,1)] && !session.packets.count,@"Suspended mouse input is rejected");
     session.suspended = NO; session.ready = NO;
     Check(![session sendReport:10 payload:MouseReport(0,1,1)] && !session.packets.count,@"Offline mouse input is rejected");
+}
+
+static void NavigationTests(void) {
+    TestSession *session = [TestSession new];
+    Check([session sendNavigationUsage:0x0224],@"Back sends a press/release pair");
+    Expect(session,0,NO,@"A1 02 01 00"); Expect(session,1,NO,@"A1 02 00 00");
+    Check([session sendNavigationUsage:0x0223],@"Home sends a press/release pair");
+    Expect(session,2,NO,@"A1 02 04 00"); Expect(session,3,NO,@"A1 02 00 00");
+    for (unsigned bit = 0; bit < 16; bit++) if (bit != 0 && bit != 2) {
+        uint16_t value = (uint16_t)(1U << bit);
+        Check(![session sendReport:2 payload:Bytes((uint8_t[]){value & 255,value >> 8},2)],@"Every other consumer bit is rejected without transmission");
+    }
+    Check(![session sendReport:2 payload:ParseHex(@"05 00")] && session.packets.count == 4,@"Combined navigation bits are rejected");
+    session.protocolMode = 0;
+    Check(![session sendNavigationUsage:0x0224] && ![session sendReport:2 payload:ParseHex(@"00 00")] && session.packets.count == 4,@"Consumer packets cannot collide with boot mouse ID 2");
+    [session handlePacket:ParseHex(@"41 02") control:YES]; Expect(session,4,YES,@"A1 02 00 00 00");
+    session.protocolMode = 1; session.consumerControls = 4;
+    [session handlePacket:ParseHex(@"41 02") control:YES]; Expect(session,5,YES,@"A1 02 04 00");
+    [session disconnect]; Expect(session,6,NO,@"A1 02 00 00");
+    session = [TestSession new];
+    Check([session openRecentApps],@"Recents delivers a complete held Windows+Tab shortcut");
+    Expect(session,0,NO,@"A1 01 00 00 00 00 00 00 00 00");
+    Expect(session,1,NO,@"A1 01 08 00 00 00 00 00 00 00");
+    Expect(session,2,NO,@"A1 01 08 00 2B 00 00 00 00 00");
+    Expect(session,3,NO,@"A1 01 08 00 00 00 00 00 00 00");
+    Expect(session,4,NO,@"A1 01 00 00 00 00 00 00 00 00");
+    session = [TestSession new]; session.failAt = 2;
+    Check(![session openRecentApps] && session.packets.count == 2,@"Recents stops on a failed stage and does not try another shortcut");
 }
 
 static void InputTests(void) {
@@ -369,6 +409,154 @@ static void ForwardingTests(void) {
     Check(session.connectCount == 1,@"A failed connection remains idle instead of retrying");
     session.connectFailure = NO; [app connectionAction:nil];
     Check(session.ready && session.connectCount == 2 && session.packets.count == 13,@"Manual reconnect succeeds without replaying old input");
+}
+
+// Synthetic AppKit event values exercise gesture arbitration without touching
+// Bluetooth or changing the user's system trackpad gesture settings.
+@interface PadTestTouch : NSObject
+@property (strong) id identity, device;
+@property NSTouchPhase phase;
+@property NSPoint normalizedPosition;
+@property NSSize deviceSize;
+@end
+@implementation PadTestTouch
+@end
+@interface PadTestEvent : NSObject
+@property NSEventPhase phase, momentumPhase;
+@property CGFloat scrollingDeltaX, scrollingDeltaY;
+@property BOOL hasPreciseScrollingDeltas;
+@property (strong) NSArray<PadTestTouch *> *touches;
+- (NSSet *)touchesMatchingPhase:(NSTouchPhase)phase inView:(NSView *)view;
+@end
+@implementation PadTestEvent
+- (NSSet *)touchesMatchingPhase:(NSTouchPhase)phase inView:(NSView *)view {
+    (void)view; NSMutableSet *result = [NSMutableSet set];
+    for (PadTestTouch *touch in self.touches) if (touch.phase & phase) [result addObject:touch];
+    return result;
+}
+@end
+static NSEvent *PadScroll(NSEventPhase phase, double x, double y, NSEventPhase momentum) {
+    PadTestEvent *event = [PadTestEvent new]; event.phase = phase; event.momentumPhase = momentum;
+    event.scrollingDeltaX = x; event.scrollingDeltaY = y; event.hasPreciseScrollingDeltas = YES;
+    return (NSEvent *)event;
+}
+static NSEvent *PadTouches(NSUInteger count, NSTouchPhase phase, double y) {
+    PadTestEvent *event = [PadTestEvent new]; NSMutableArray *touches = [NSMutableArray array];
+    for (NSUInteger i = 0; i < count; i++) {
+        PadTestTouch *touch = [PadTestTouch new]; touch.identity = @(i); touch.device = @1;
+        touch.phase = phase; touch.normalizedPosition = NSMakePoint(0.2+0.1*i,y); touch.deviceSize = NSMakeSize(100,100);
+        [touches addObject:touch];
+    }
+    event.touches = touches; return (NSEvent *)event;
+}
+static void PadGestureTests(void) {
+    AnikeyApp *app = [AnikeyApp new]; TestSession *session = [TestSession new]; app.session = session;
+    CursorPad *pad = [[CursorPad alloc] initWithFrame:NSMakeRect(0,0,400,140)]; app.cursorPad = pad; pad.owner = app;
+    [pad scrollWheel:PadScroll(NSEventPhaseBegan,0,0,0)];
+    [pad scrollWheel:PadScroll(NSEventPhaseChanged,0,-24,0)]; [app flushPointer:nil];
+    Expect(session,0,NO,@"A1 0A 00 00 00 00 FE");
+    [pad scrollWheel:PadScroll(NSEventPhaseEnded,0,0,0)];
+    [pad scrollWheel:PadScroll(NSEventPhaseNone,0,-120,NSEventPhaseChanged)]; [app flushPointer:nil];
+    Check(session.packets.count == 1,@"Lifting fingers stops scroll; inertia is not forwarded");
+    for (NSNumber *direction in @[@-1,@1]) {
+        [session.packets removeAllObjects];
+        [pad scrollWheel:PadScroll(NSEventPhaseBegan,0,0,0)];
+        [pad scrollWheel:PadScroll(NSEventPhaseChanged,45*direction.intValue,0,0)]; [app flushPointer:nil];
+        Check(!session.packets.count,@"Horizontal swipes do not send wheel or mouse clicks");
+        [pad scrollWheel:PadScroll(NSEventPhaseEnded,0,0,0)];
+        Expect(session,0,NO,@"A1 02 01 00"); Expect(session,1,NO,@"A1 02 00 00");
+        Check(session.packets.count == 2,@"Either sideways direction produces exactly one Back without requiring an edge");
+    }
+    [session.packets removeAllObjects];
+    [pad scrollWheel:PadScroll(NSEventPhaseBegan,0,0,0)];
+    [pad scrollWheel:PadScroll(NSEventPhaseChanged,22,22,0)];
+    [pad scrollWheel:PadScroll(NSEventPhaseEnded,0,0,0)]; [app flushPointer:nil];
+    Check(!session.packets.count,@"Ambiguous diagonal motion cannot trigger navigation");
+    [pad scrollWheel:PadScroll(NSEventPhaseBegan,0,0,0)];
+    [pad scrollWheel:PadScroll(NSEventPhaseChanged,0,24,0)]; [app flushPointer:nil];
+    [pad scrollWheel:PadScroll(NSEventPhaseChanged,90,12,0)]; [app flushPointer:nil];
+    [pad scrollWheel:PadScroll(NSEventPhaseEnded,0,0,0)];
+    Check(session.packets.count == 2,@"A scroll stays a scroll even when the finger changes direction");
+    Expect(session,0,NO,@"A1 0A 00 00 00 00 02"); Expect(session,1,NO,@"A1 0A 00 00 00 00 01");
+    [session.packets removeAllObjects];
+    [pad scrollWheel:PadScroll(NSEventPhaseBegan,50,0,0)];
+    [pad scrollWheel:PadScroll(NSEventPhaseCancelled,0,0,0)];
+    Check(!session.packets.count,@"Cancelled swipes never navigate");
+    [pad touchesBeganWithEvent:PadTouches(3,NSTouchPhaseBegan,0.2)];
+    [pad scrollWheel:PadScroll(NSEventPhaseBegan,0,100,0)]; [app flushPointer:nil];
+    Check(!session.packets.count,@"macOS three-finger gestures cannot leak wheel input");
+    [pad touchesMovedWithEvent:PadTouches(3,NSTouchPhaseMoved,0.7)];
+    [pad touchesEndedWithEvent:PadTouches(3,NSTouchPhaseEnded,0.7)];
+    [pad scrollWheel:PadScroll(NSEventPhaseEnded,0,0,0)];
+    Check(!session.packets.count,@"Three-finger up is left to macOS without a navigation or scroll tail");
+    [pad touchesBeganWithEvent:PadTouches(3,NSTouchPhaseBegan,0.7)];
+    [pad touchesMovedWithEvent:PadTouches(3,NSTouchPhaseMoved,0.2)];
+    [pad touchesEndedWithEvent:PadTouches(3,NSTouchPhaseEnded,0.2)];
+    Check(!session.packets.count,@"Three-finger down cannot send Recents to the phone");
+    [pad touchesBeganWithEvent:PadTouches(3,NSTouchPhaseBegan,0.2)];
+    [pad touchesBeganWithEvent:PadTouches(4,NSTouchPhaseBegan,0.3)];
+    [pad touchesEndedWithEvent:PadTouches(4,NSTouchPhaseEnded,0.8)];
+    Check(!session.packets.count,@"Four-finger system gestures cannot be mistaken for Home");
+    [pad touchesBeganWithEvent:PadTouches(3,NSTouchPhaseBegan,0.2)];
+    [pad touchesCancelledWithEvent:PadTouches(3,NSTouchPhaseCancelled,0.8)];
+    Check(!session.packets.count && !pad.touchSequenceBlocked,@"Cancelling touches ends the ignored sequence");
+    app.transport = [TransportWorker new];
+    [app.transport perform:^{ Pump(0.1); }];
+    [pad scrollWheel:PadScroll(NSEventPhaseBegan,0,0,0)];
+    [pad scrollWheel:PadScroll(NSEventPhaseChanged,0,48,0)]; [app flushPointer:nil];
+    [pad mouseExited:PadScroll(NSEventPhaseEnded,0,0,0)];
+    __block BOOL drained = NO;
+    [app onTransport:^(AnikeySession *transport) { (void)transport; } completion:^{ drained = YES; }];
+    NSTimeInterval deadline = NSProcessInfo.processInfo.systemUptime+2;
+    while (!drained && NSProcessInfo.processInfo.systemUptime < deadline) Pump(0.005);
+    Check(drained && !session.packets.count,@"Pad exit discards scroll queued behind a blocked write");
+    [app.transport finish];
+    while (app.transport.thread && NSProcessInfo.processInfo.systemUptime < deadline) Pump(0.005);
+    Check(!app.transport.thread,@"Gesture worker terminates after cancellation");
+}
+static void PadDragTests(void) {
+    AnikeyApp *app = [AnikeyApp new]; TestSession *session = [TestSession new]; app.session = session;
+    [app beginPointerDrag];
+    Check(app.pointerButtons == 1,@"Pressing starts a held phone button");
+    Expect(session,0,NO,@"A1 0A 01 00 00 00 00");
+    [app.motion addX:20 y:-12]; [app flushPointer:nil];
+    Expect(session,1,NO,@"A1 0A 01 14 F4 00 00");
+    [app sendPointerButton:2]; Check(session.packets.count == 2,@"Secondary clicks cannot replace an active drag");
+    [app.motion addX:2 y:3]; [app endPointerDrag];
+    Expect(session,2,NO,@"A1 0A 01 02 03 00 00"); Expect(session,3,NO,@"A1 0A 00 00 00 00 00");
+    Check(!app.pointerButtons && ((const uint8_t *)session.mouse.bytes)[0] == 0,@"Release flushes final held movement then lets go");
+    [app.motion addX:1 y:0]; [app flushPointer:nil]; Expect(session,4,NO,@"A1 0A 00 01 00 00 00");
+    [session.packets removeAllObjects];
+    [app beginPointerDrag]; [app.motion addX:100 y:100]; [app releaseInput];
+    Expect(session,0,NO,@"A1 0A 01 00 00 00 00"); Expect(session,1,NO,@"A1 0A 00 00 00 00 00");
+    Expect(session,2,NO,@"A1 01 00 00 00 00 00 00 00 00");
+    Check(session.packets.count == 3 && ![app.motion takeReport],@"Focus loss releases the drag and discards movement");
+    [session.packets removeAllObjects];
+    app.transport = [TransportWorker new];
+    [app.transport perform:^{ Pump(0.1); }];
+    [app beginPointerDrag]; [app endPointerDrag];
+    __block BOOL drained = NO;
+    [app onTransport:^(AnikeySession *transport) { (void)transport; } completion:^{ drained = YES; }];
+    NSTimeInterval deadline = NSProcessInfo.processInfo.systemUptime+2;
+    while (!drained && NSProcessInfo.processInfo.systemUptime < deadline) Pump(0.005);
+    Check(drained && session.packets.count == 2,@"A quick click queued before the worker runs preserves both press and release");
+    Expect(session,0,NO,@"A1 0A 01 00 00 00 00"); Expect(session,1,NO,@"A1 0A 00 00 00 00 00");
+    [app.transport finish];
+    while (app.transport.thread && NSProcessInfo.processInfo.systemUptime < deadline) Pump(0.005);
+    SlowWriteSession *slow = [SlowWriteSession new]; app.session = slow; app.transport = [TransportWorker new];
+    [app beginPointerDrag]; deadline = NSProcessInfo.processInfo.systemUptime+2;
+    while (!slow.enteredWrite && NSProcessInfo.processInfo.systemUptime < deadline) Pump(0.005);
+    Check(slow.enteredWrite,@"The press is inside a blocked Bluetooth write");
+    [app.motion addX:80 y:-50]; [app flushPointer:nil]; [app resetPointer];
+    drained = NO;
+    [app onTransport:^(AnikeySession *transport) { (void)transport; } completion:^{ drained = YES; }];
+    while (!drained && NSProcessInfo.processInfo.systemUptime < deadline) Pump(0.005);
+    Check(drained && slow.packets.count == 2,@"Cancellation drops queued dragging but preserves release after a blocked press completes");
+    Expect(slow,0,NO,@"A1 0A 01 00 00 00 00"); Expect(slow,1,NO,@"A1 0A 00 00 00 00 00");
+    Check(!app.pointerButtons && ((const uint8_t *)slow.mouse.bytes)[0] == 0,@"Cancellation leaves no held phone button");
+    [app.transport finish];
+    while (app.transport.thread && NSProcessInfo.processInfo.systemUptime < deadline) Pump(0.005);
+    Check(!app.transport.thread,@"Drag worker shuts down cleanly");
 }
 static void ConnectionLifecycleTests(void) {
     TestSession *session = [TestSession new]; session.connecting = YES; session.ready = NO;
@@ -535,7 +723,7 @@ static void UISmokeTest(NSString *destination) {
     Check(app.window.visible && app.devices.numberOfItems == 1,@"Native window opens with device picker");
     Check(app.window.firstResponder == app.keyboardSurface && app.keyboardSurface.acceptsFirstResponder,@"Native keyboard area receives focus without a Send button");
     Check([app.window.title containsString:@"Bluetooth Keyboard"] && NSApp.mainMenu.numberOfItems >= 1,@"Keyboard title and native Quit menu exist");
-    Check(app.inputControls.count == 7,@"Keyboard controls and two explicit mouse buttons appear");
+    Check(app.inputControls.count == 8,@"Keyboard and navigation controls appear without separate mouse buttons");
     [app.pointerTimer invalidate];
     Check(session.connectCount == 0 && app.connectionButton.enabled,@"Startup stays idle with manual Connect");
     [app.connectionButton performClick:nil];
@@ -594,20 +782,19 @@ static void UISmokeTest(NSString *destination) {
     [app.cursorPad mouseDown:press]; [app.cursorPad mouseDragged:move]; [app flushPointer:nil];
     Check(app.cursorPad.controlling && NSEqualPoints(app.cursorPad.lastPoint,NSMakePoint(50,40)),@"Local marker follows the drag during preview");
     Check(!session.packets.count && app.motion.x == 0,@"Preview never transmits movement");
-    Check(!app.inputControls[5].enabled && !app.inputControls[6].enabled,@"Unvalidated mouse buttons are disabled");
-    [app pointerClick:app.inputControls[5]]; Check(!session.packets.count,@"Calling click action cannot bypass validation");
+    [app sendPointerButton:2]; Check(!session.packets.count,@"Calling secondary click cannot bypass mouse validation");
     [app.cursorPad mouseUp:press]; Check(app.cursorPad.controlling && !app.cursorPad.pressed,@"Mouse release clears click feedback while hover stays active");
     session.mouseValidated = YES; [app refreshControls]; // Test fixture only, never a production setting.
     [app resetPointer]; [app.cursorPad mouseEntered:press];
     Check(app.motion.x == 0,@"Entering the pad establishes an origin without a jump");
-    [app.cursorPad mouseMoved:move]; [app.cursorPad scrollWheel:move]; [app flushPointer:nil];
+    [app.cursorPad mouseMoved:move]; [app flushPointer:nil];
     Expect(session,0,NO,@"A1 0A 00 1E 14 00 00");
     [app.cursorPad mouseDown:move]; [app.cursorPad mouseUp:move];
     Expect(session,1,NO,@"A1 0A 01 00 00 00 00"); Expect(session,2,NO,@"A1 0A 00 00 00 00 00");
-    Check(session.packets.count == 3 && app.cursorPad.controlling && !app.cursorPad.pressed,@"Clicking the pad taps the mouse once without holding a remote drag");
-    [app.inputControls[5] performClick:nil];
+    Check(session.packets.count == 3 && app.cursorPad.controlling && !app.cursorPad.pressed && !app.pointerButtons,@"Clicking and releasing the pad sends one complete tap");
+    [app.cursorPad mouseDown:move]; [app.cursorPad mouseUp:move];
     Expect(session,3,NO,@"A1 0A 01 00 00 00 00"); Expect(session,4,NO,@"A1 0A 00 00 00 00 00");
-    [app.inputControls[6] performClick:nil];
+    [app.cursorPad rightMouseDown:move];
     Expect(session,5,NO,@"A1 0A 02 00 00 00 00"); Expect(session,6,NO,@"A1 0A 00 00 00 00 00");
     [app.motion addX:12 y:-6]; [app sendPointerButton:1];
     Expect(session,7,NO,@"A1 0A 00 0C FA 00 00");
@@ -616,6 +803,17 @@ static void UISmokeTest(NSString *destination) {
     [app.motion addX:60 y:-40]; [app.cursorPad mouseExited:move]; [app flushPointer:nil];
     Check(!app.cursorPad.controlling && app.motion.x == 0 && session.packets.count == 10,@"Leaving the pad discards remaining motion");
     [app releaseInput];
+    CheckBounds(app.window.contentView);
+    [app.motion addWheel:12]; app.padSizeSlider.doubleValue = 0; [app resizePad:nil];
+    Check(NSHeight(app.cursorPad.frame) == 104 && NSWidth(app.cursorPad.frame) == 360 && ![app.motion takeReport],@"Small pad size cancels pending input and fits its minimum area");
+    app.padSizeSlider.doubleValue = 1; [app resizePad:nil]; Pump(0.05);
+    Check(fabs(NSHeight(app.cursorPad.frame)-280) < 1 && fabs(NSWidth(app.cursorPad.frame)-580) < 1,
+        [NSString stringWithFormat:@"Pad size slider expands its area (pad=%@, content=%@, frame=%@, screen=%@, slider=%.3f)",NSStringFromRect(app.cursorPad.frame),NSStringFromRect(app.window.contentView.bounds),NSStringFromRect(app.window.frame),NSStringFromRect(app.window.screen.visibleFrame),app.padSizeSlider.doubleValue]);
+    [app.window setContentSize:NSMakeSize(800,720)];
+    [app windowDidResize:[NSNotification notificationWithName:NSWindowDidResizeNotification object:app.window]];
+    Check(NSWidth(app.cursorPad.frame) == 760 && NSHeight(app.cursorPad.frame) == 342,@"Window resizing expands the usable pad");
+    CheckBounds(app.window.contentView);
+    [app.window setContentSize:NSMakeSize(620,550)]; app.padSizeSlider.doubleValue = 0.35; [app resizePad:nil];
     CheckBounds(app.window.contentView);
 
     [app.connectionButton performClick:nil];
@@ -631,8 +829,8 @@ static void UISmokeTest(NSString *destination) {
 }
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
-        if (argc == 3 && strcmp(argv[1],"--ui-smoke") == 0) { UISmokeTest(@(argv[2])); ResponsiveConnectionTest(); BoundedQuitTest(); }
-        else { DescriptorTests(); MouseTests(); InputTests(); ProtocolTests(); ForwardingTests(); ConnectionLifecycleTests(); WorkerTests(); }
+        if (argc == 3 && strcmp(argv[1],"--ui-smoke") == 0) { UISmokeTest(@(argv[2])); PadGestureTests(); PadDragTests(); ResponsiveConnectionTest(); BoundedQuitTest(); }
+        else { DescriptorTests(); MouseTests(); NavigationTests(); InputTests(); ProtocolTests(); ForwardingTests(); ConnectionLifecycleTests(); WorkerTests(); }
         printf("PASS: %u checks (no Bluetooth accessed)\n",Checks);
     }
     return 0;
