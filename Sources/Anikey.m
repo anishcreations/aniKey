@@ -191,11 +191,12 @@ static NSData *MouseReport(uint8_t buttons, int x, int y) { return MouseWheelRep
 typedef struct { uint8_t usage, modifiers; } Key;
 typedef NS_ENUM(NSInteger, PadAction) { PadActionNone, PadActionBack, PadActionHome, PadActionRecentApps };
 typedef NS_ENUM(NSInteger, PadAxis) { PadAxisUndecided, PadAxisHorizontal, PadAxisVertical };
-static PadAxis DominantPadAxis(double x, double y, double threshold) {
+static const double PadContentDragDistance = 12;
+static const double PadScrollPointsPerStep = 12;
+static PadAxis ScrollPadAxis(double x, double y) {
     if (!isfinite(x) || !isfinite(y)) return PadAxisUndecided;
-    if (fabs(x) >= threshold && fabs(x) > fabs(y)*1.35) return PadAxisHorizontal;
-    if (fabs(y) >= threshold && fabs(y) > fabs(x)*1.35) return PadAxisVertical;
-    return PadAxisUndecided;
+    if (MAX(fabs(x),fabs(y)) < 6) return PadAxisUndecided;
+    return fabs(x) > fabs(y) ? PadAxisHorizontal : PadAxisVertical;
 }
 static BOOL ASCIIKey(unichar character, Key *key) {
     key->modifiers = 0;
@@ -748,7 +749,7 @@ static uint8_t PhysicalModifiers(NSEventModifierFlags flags) {
 @interface CursorPad : NSView
 @property (weak) AnikeyApp *owner;
 @property (strong) NSTrackingArea *tracking;
-@property BOOL controlling, pressed, gestureActive;
+@property BOOL controlling, pressed, gestureActive, scrollDragging;
 @property NSPoint lastPoint;
 @property CGFloat gestureDeltaX, gestureDeltaY;
 @property PadAxis gestureAxis;
@@ -789,6 +790,7 @@ static uint8_t PhysicalModifiers(NSEventModifierFlags flags) {
 - (void)sendPointerButton:(uint8_t)button;
 - (void)beginPointerDrag;
 - (void)endPointerDrag;
+- (void)endPointerScroll;
 - (NSArray<NSData *> *)takePointerReports:(uint8_t)buttons;
 - (void)sendNavigationUsage:(uint16_t)usage;
 - (void)performPadAction:(PadAction)action;
@@ -846,7 +848,7 @@ static uint8_t PhysicalModifiers(NSEventModifierFlags flags) {
     [self addTrackingArea:self.tracking];
 }
 - (void)reset {
-    self.controlling = self.pressed = self.gestureActive = NO;
+    self.controlling = self.pressed = self.gestureActive = self.scrollDragging = NO;
     self.touchSequenceBlocked = NO; self.touchCount = 0;
     self.gestureAxis = PadAxisUndecided; self.gestureDeltaX = self.gestureDeltaY = 0;
     self.gestureFeedback = nil; self.needsDisplay = YES;
@@ -868,17 +870,26 @@ static uint8_t PhysicalModifiers(NSEventModifierFlags flags) {
     self.lastPoint = point; self.needsDisplay = YES;
 }
 - (void)mouseDown:(NSEvent *)event {
+    if (self.pressed || self.touchSequenceBlocked) return;
+    // A physical press takes over from a scroll sequence that has not yet ended.
+    if (self.gestureActive) [self.owner resetPointer];
     [self mouseMoved:event];
-    if (!self.controlling || self.touchSequenceBlocked || self.gestureActive) return;
-    self.pressed = YES; self.needsDisplay = YES;
+    if (!self.controlling) return;
+    self.pressed = YES;
+    self.gestureFeedback = nil; self.needsDisplay = YES;
     [self.owner beginPointerDrag];
 }
-- (void)mouseDragged:(NSEvent *)event { if (self.pressed) [self mouseMoved:event]; }
+- (void)mouseDragged:(NSEvent *)event {
+    if (!self.pressed) return;
+    [self mouseMoved:event];
+    [self.owner flushPointer:nil];
+}
 - (void)mouseUp:(NSEvent *)event {
     if (!self.pressed) return;
     [self mouseMoved:event];
     [self.owner endPointerDrag];
     self.pressed = NO; self.needsDisplay = YES;
+    self.gestureFeedback = nil;
 }
 - (void)rightMouseDown:(NSEvent *)event {
     if (self.pressed || self.gestureActive || self.touchSequenceBlocked) return;
@@ -886,49 +897,59 @@ static uint8_t PhysicalModifiers(NSEventModifierFlags flags) {
 }
 - (void)rightMouseUp:(NSEvent *)event { (void)event; }
 - (void)scrollWheel:(NSEvent *)event {
-    if (![self.owner canSendInput] || !self.owner.session.mouseValidated) return;
+    if (![self.owner canSendInput] || !self.owner.session.mouseValidated) { [self.owner resetPointer]; return; }
+    // A held physical click owns the interaction. In particular, a late scroll
+    // cancellation must not release or reinterpret a newer pointer drag.
+    if (self.pressed) return;
+    if (event.phase & NSEventPhaseCancelled) { [self.owner resetPointer]; return; }
     // macOS owns gestures with three or more fingers. Ignore their scroll tails
     // and inertia so they cannot move or click the phone.
     if (event.momentumPhase != NSEventPhaseNone || self.touchSequenceBlocked || self.touchCount >= 3) return;
-    if (event.phase & NSEventPhaseCancelled) { [self.owner resetPointer]; return; }
     if (event.phase == NSEventPhaseNone) {
         if (!self.gestureActive && !self.pressed && self.owner.session.protocolMode) {
-            [self.owner.motion addWheel:event.scrollingDeltaY/(event.hasPreciseScrollingDeltas ? 12.0 : 1.0)];
+            [self.owner.motion addWheel:event.scrollingDeltaY/(event.hasPreciseScrollingDeltas ? PadScrollPointsPerStep : 1.0)];
             self.gestureFeedback = @"Scrolling"; self.needsDisplay = YES;
         }
         return; // Unphased mouse wheels scroll, but cannot navigate.
     }
     if (event.phase & NSEventPhaseBegan) {
         [self.owner resetPointer];
-        self.pressed = NO; self.gestureActive = YES; self.gestureAxis = PadAxisUndecided;
+        self.controlling = YES; self.pressed = NO; self.gestureActive = YES; self.gestureAxis = PadAxisUndecided;
         self.gestureDeltaX = self.gestureDeltaY = 0; self.gestureFeedback = nil;
     }
     if (!self.gestureActive) return;
     self.gestureDeltaX += event.scrollingDeltaX; self.gestureDeltaY += event.scrollingDeltaY;
-    CGFloat scroll = event.scrollingDeltaY;
+    CGFloat scroll = event.scrollingDeltaY, horizontal = event.scrollingDeltaX;
     if (self.gestureAxis == PadAxisUndecided) {
-        self.gestureAxis = DominantPadAxis(self.gestureDeltaX,self.gestureDeltaY,6);
+        self.gestureAxis = ScrollPadAxis(self.gestureDeltaX,self.gestureDeltaY);
         scroll = self.gestureDeltaY; // Include distance accumulated before axis lock.
+        horizontal = self.gestureDeltaX;
     }
     if (self.gestureAxis == PadAxisVertical) {
         if (self.owner.session.protocolMode) {
-            [self.owner.motion addWheel:scroll/(event.hasPreciseScrollingDeltas ? 12.0 : 1.0)];
+            [self.owner.motion addWheel:scroll/(event.hasPreciseScrollingDeltas ? PadScrollPointsPerStep : 1.0)];
             self.gestureFeedback = @"Scrolling";
         } else self.gestureFeedback = @"Scrolling needs report mode";
-    } else if (self.gestureAxis == PadAxisHorizontal) self.gestureFeedback = @"Swipe sideways for Back";
+    } else if (self.gestureAxis == PadAxisHorizontal) {
+        if (!self.scrollDragging && fabs(self.gestureDeltaX) >= PadContentDragDistance) {
+            // Keep the paired host's existing mouse report layout: horizontal
+            // content scrolling is a primary-button drag, not a new HID axis.
+            [self.owner beginPointerDrag]; self.scrollDragging = self.owner.pointerButtons == 1;
+            horizontal = self.gestureDeltaX;
+        }
+        if (self.scrollDragging) {
+            [self.owner.motion addX:horizontal y:0]; [self.owner flushPointer:nil];
+            self.gestureFeedback = @"Sliding content";
+        }
+    }
     self.needsDisplay = YES;
     if (event.phase & NSEventPhaseEnded) {
-        self.owner.pointerEpoch++; [self.owner.motion reset];
-        BOOL back = self.gestureAxis == PadAxisHorizontal &&
-            DominantPadAxis(self.gestureDeltaX,self.gestureDeltaY,36) == PadAxisHorizontal;
+        if (self.scrollDragging) [self.owner endPointerDrag];
+        else [self.owner endPointerScroll];
+        self.scrollDragging = NO;
         self.gestureActive = NO;
-        if (back) [self finishAction:PadActionBack];
+        self.gestureFeedback = nil;
     }
-}
-- (void)finishAction:(PadAction)action {
-    if (![self.owner canSendInput]) return;
-    self.gestureFeedback = action == PadActionBack ? @"Back" : action == PadActionHome ? @"Home" : @"Recent apps";
-    [self.owner performPadAction:action]; self.needsDisplay = YES;
 }
 - (void)trackTouches:(NSEvent *)event {
     NSSet<NSTouch *> *touching = [event touchesMatchingPhase:NSTouchPhaseTouching inView:self];
@@ -943,7 +964,13 @@ static uint8_t PhysicalModifiers(NSEventModifierFlags flags) {
 - (void)touchesBeganWithEvent:(NSEvent *)event { [self trackTouches:event]; }
 - (void)touchesMovedWithEvent:(NSEvent *)event { [self trackTouches:event]; }
 - (void)touchesEndedWithEvent:(NSEvent *)event { [self trackTouches:event]; }
-- (void)touchesCancelledWithEvent:(NSEvent *)event { (void)event; [self.owner resetPointer]; }
+- (void)touchesCancelledWithEvent:(NSEvent *)event {
+    (void)event;
+    // The raw touch stream and the physical mouse button have separate lives.
+    // Only native mouse-up, pad exit or focus loss ends a physical drag.
+    if (self.pressed) { self.touchCount = 0; self.touchSequenceBlocked = NO; return; }
+    [self.owner resetPointer];
+}
 - (void)mouseExited:(NSEvent *)event { (void)event; [self.owner resetPointer]; }
 - (void)drawRect:(NSRect)dirty {
     (void)dirty;
@@ -951,11 +978,11 @@ static uint8_t PhysicalModifiers(NSEventModifierFlags flags) {
     NSBezierPath *shape = [NSBezierPath bezierPathWithRoundedRect:NSInsetRect(self.bounds,0.5,0.5) xRadius:10 yRadius:10];
     [shape fill]; [(self.controlling ? NSColor.controlAccentColor : NSColor.separatorColor) setStroke]; [shape stroke];
     BOOL available = self.owner.session.mouseValidated && [self.owner canSendInput];
-    NSString *title = self.gestureFeedback ?: (available ? (self.pressed ? @"Pressed · Slide to drag" : @"Move pointer · Click to tap") : @"Connect to control the phone");
+    NSString *title = self.gestureFeedback ?: (available ? (self.pressed ? @"Holding · Slide to drag" : @"Move pointer · Click to open") : @"Connect to control the phone");
     if (self.controlling) {
         NSPoint point = self.lastPoint;
         [NSColor.controlAccentColor setFill];
-        CGFloat radius = self.pressed ? 9 : 6;
+        CGFloat radius = (self.pressed || self.scrollDragging) ? 9 : 6;
         [[NSBezierPath bezierPathWithOvalInRect:NSMakeRect(point.x-radius,point.y-radius,radius*2,radius*2)] fill];
         [NSColor.labelColor setStroke];
         NSBezierPath *cross = [NSBezierPath bezierPath];
@@ -964,8 +991,8 @@ static uint8_t PhysicalModifiers(NSEventModifierFlags flags) {
     }
     [title drawAtPoint:NSMakePoint(16,28) withAttributes:@{NSFontAttributeName:[NSFont systemFontOfSize:14 weight:NSFontWeightMedium],NSForegroundColorAttributeName:NSColor.labelColor}];
     NSDictionary *hint = @{NSFontAttributeName:[NSFont systemFontOfSize:11],NSForegroundColorAttributeName:NSColor.secondaryLabelColor};
-    [@"Hold click + slide: drag · Release to let go" drawAtPoint:NSMakePoint(16,56) withAttributes:hint];
-    [@"2 fingers: scroll ↕ · Sideways: Back" drawAtPoint:NSMakePoint(16,73) withAttributes:hint];
+    [@"Click to tap · Hold + drag to swipe content" drawAtPoint:NSMakePoint(16,56) withAttributes:hint];
+    [@"2 fingers: scroll ↕ · Slide content ↔" drawAtPoint:NSMakePoint(16,73) withAttributes:hint];
 }
 @end
 
@@ -1064,7 +1091,8 @@ static uint8_t PhysicalModifiers(NSEventModifierFlags flags) {
     self.keyboardSurface.autoresizingMask |= NSViewWidthSizable; paste.autoresizingMask |= NSViewMinXMargin;
     footer.autoresizingMask = NSViewWidthSizable;
     [self resizePad:nil];
-    self.pointerTimer = [NSTimer scheduledTimerWithTimeInterval:1.0/60 target:self selector:@selector(flushPointer:) userInfo:nil repeats:YES];
+    self.pointerTimer = [NSTimer timerWithTimeInterval:1.0/60 target:self selector:@selector(flushPointer:) userInfo:nil repeats:YES];
+    [NSRunLoop.mainRunLoop addTimer:self.pointerTimer forMode:NSRunLoopCommonModes];
     __weak AnikeyApp *weakSelf = self;
 
     self.eventMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown|NSEventMaskKeyUp|NSEventMaskFlagsChanged handler:^NSEvent *(NSEvent *event) {
@@ -1273,7 +1301,12 @@ static uint8_t PhysicalModifiers(NSEventModifierFlags flags) {
     self.pointerBusy = YES; NSUInteger epoch = self.pointerEpoch;
     [self enqueueInput:^(AnikeySession *session) {
         if (epoch == self.pointerEpoch) [session sendReport:10 payload:report];
-    } completion:^{ self.pointerBusy = NO; }];
+    } completion:^{
+        self.pointerBusy = NO;
+        // Coalesce input received during writeSync, then drain it immediately.
+        // There is still at most one motion write queued/in flight.
+        if (!self.terminating && [self canSendInput]) [self flushPointer:nil];
+    }];
 }
 - (NSArray<NSData *> *)takePointerReports:(uint8_t)buttons {
     NSMutableArray *reports = [NSMutableArray array]; NSData *report;
@@ -1282,6 +1315,14 @@ static uint8_t PhysicalModifiers(NSEventModifierFlags flags) {
         [reports addObject:packet];
     }
     return reports;
+}
+- (void)endPointerScroll {
+    // Finishing is not cancellation: preserve the accepted wheel report and
+    // one bounded final packet, even when a fast flick ends before writeSync.
+    // Drop fractions and excess backlog so there is no long tail after lift.
+    self.motion.x = self.motion.y = 0;
+    self.motion.wheel = trunc(MAX(-8,MIN(8,self.motion.wheel)));
+    [self flushPointer:nil];
 }
 - (void)beginPointerDrag {
     if (![self canSendInput] || !self.session.mouseValidated || self.pointerButtons) return;
