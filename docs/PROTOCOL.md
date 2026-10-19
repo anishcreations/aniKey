@@ -16,6 +16,8 @@ Cancellation invalidates queued motion but preserves a button release on the tra
 
 Normal scroll completion preserves the accepted wheel write and at most one final packet of eight steps. Fractions and excess backlog are dropped on lift. Cancellation invalidates queued scrolling, including that final packet.
 
+Two-finger vertical deltas use a saved sensitivity multiplier (Extra slow 0.125, Gentle 0.5, Standard 1.0, Fast 1.5) before conversion to integer wheel steps. Complete steps request an immediate write; fractions carry into the next event. This preserves the existing descriptor and mouse report layout. Once AppKit recognizes a scroll, its scroll-phase events own completion and cancellation; raw touch cancellation alone does not release an active sideways drag.
+
 Recents uses a staged Windows/Meta+Tab keyboard chord: neutral, GUI modifier down, GUI+Tab down, Tab up while GUI remains down, then GUI up. The modifier leads Tab by 35 ms; Tab is held for 50 ms, followed by a 20 ms delay before modifier release. This follows Android's [Meta+Tab system shortcut](https://android.googlesource.com/platform/frameworks/base/+/refs/heads/android15-release/services/core/java/com/android/server/policy/PhoneWindowManager.java), also documented in [Samsung's keyboard shortcuts](https://www.samsung.com/us/support/answer/ANS10003477/). It adds no consumer usage, emits no media controls, and never retries with an alternative shortcut. Firmware determines how the shortcut is handled; these are not touchscreen contact reports.
 
 Keyboard input supports modifiers and up to six held usages. Text commands map US-layout ASCII to key presses and releases. Unsupported characters are rejected before the first key; transmission failures stop the action without retrying it.

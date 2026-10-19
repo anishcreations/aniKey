@@ -768,6 +768,8 @@ static uint8_t PhysicalModifiers(NSEventModifierFlags flags) {
 @property (strong) KeyboardSurface *keyboardSurface;
 @property (strong) CursorPad *cursorPad;
 @property (strong) NSSlider *padSizeSlider;
+@property (strong) NSPopUpButton *scrollSpeedPicker;
+@property double scrollScale;
 @property (strong) PointerMotion *motion;
 @property (strong) NSTimer *pointerTimer;
 @property BOOL pointerBusy;
@@ -796,6 +798,7 @@ static uint8_t PhysicalModifiers(NSEventModifierFlags flags) {
 - (void)performPadAction:(PadAction)action;
 - (void)padNavigation:(NSButton *)sender;
 - (void)resizePad:(NSSlider *)sender;
+- (void)changeScrollSpeed:(id)sender;
 - (void)layoutPad;
 - (void)physicalKey:(unsigned short)code down:(BOOL)down flags:(NSEventModifierFlags)flags;
 - (void)physicalFlags:(NSEvent *)event;
@@ -907,12 +910,13 @@ static uint8_t PhysicalModifiers(NSEventModifierFlags flags) {
     if (event.momentumPhase != NSEventPhaseNone || self.touchSequenceBlocked || self.touchCount >= 3) return;
     if (event.phase == NSEventPhaseNone) {
         if (!self.gestureActive && !self.pressed && self.owner.session.protocolMode) {
-            [self.owner.motion addWheel:event.scrollingDeltaY/(event.hasPreciseScrollingDeltas ? PadScrollPointsPerStep : 1.0)];
+            [self.owner.motion addWheel:event.scrollingDeltaY*(event.hasPreciseScrollingDeltas ? self.owner.scrollScale/PadScrollPointsPerStep : 1.0)];
+            [self.owner flushPointer:nil];
             self.gestureFeedback = @"Scrolling"; self.needsDisplay = YES;
         }
         return; // Unphased mouse wheels scroll, but cannot navigate.
     }
-    if (event.phase & NSEventPhaseBegan) {
+    if ((event.phase & NSEventPhaseBegan) || (!self.gestureActive && (event.phase & NSEventPhaseChanged))) {
         [self.owner resetPointer];
         self.controlling = YES; self.pressed = NO; self.gestureActive = YES; self.gestureAxis = PadAxisUndecided;
         self.gestureDeltaX = self.gestureDeltaY = 0; self.gestureFeedback = nil;
@@ -927,7 +931,8 @@ static uint8_t PhysicalModifiers(NSEventModifierFlags flags) {
     }
     if (self.gestureAxis == PadAxisVertical) {
         if (self.owner.session.protocolMode) {
-            [self.owner.motion addWheel:scroll/(event.hasPreciseScrollingDeltas ? PadScrollPointsPerStep : 1.0)];
+            [self.owner.motion addWheel:scroll*(event.hasPreciseScrollingDeltas ? self.owner.scrollScale/PadScrollPointsPerStep : 1.0)];
+            [self.owner flushPointer:nil];
             self.gestureFeedback = @"Scrolling";
         } else self.gestureFeedback = @"Scrolling needs report mode";
     } else if (self.gestureAxis == PadAxisHorizontal) {
@@ -939,7 +944,7 @@ static uint8_t PhysicalModifiers(NSEventModifierFlags flags) {
         }
         if (self.scrollDragging) {
             [self.owner.motion addX:horizontal y:0]; [self.owner flushPointer:nil];
-            self.gestureFeedback = @"Sliding content";
+            self.gestureFeedback = @"Mouse drag · Select or move items";
         }
     }
     self.needsDisplay = YES;
@@ -966,9 +971,9 @@ static uint8_t PhysicalModifiers(NSEventModifierFlags flags) {
 - (void)touchesEndedWithEvent:(NSEvent *)event { [self trackTouches:event]; }
 - (void)touchesCancelledWithEvent:(NSEvent *)event {
     (void)event;
-    // The raw touch stream and the physical mouse button have separate lives.
-    // Only native mouse-up, pad exit or focus loss ends a physical drag.
-    if (self.pressed) { self.touchCount = 0; self.touchSequenceBlocked = NO; return; }
+    // AppKit can cancel raw touches when it recognizes a scroll gesture. The
+    // scroll event stream then owns its lifecycle, just as mouse-up owns a click.
+    if (self.pressed || self.gestureActive) { self.touchCount = 0; return; }
     [self.owner resetPointer];
 }
 - (void)mouseExited:(NSEvent *)event { (void)event; [self.owner resetPointer]; }
@@ -978,7 +983,7 @@ static uint8_t PhysicalModifiers(NSEventModifierFlags flags) {
     NSBezierPath *shape = [NSBezierPath bezierPathWithRoundedRect:NSInsetRect(self.bounds,0.5,0.5) xRadius:10 yRadius:10];
     [shape fill]; [(self.controlling ? NSColor.controlAccentColor : NSColor.separatorColor) setStroke]; [shape stroke];
     BOOL available = self.owner.session.mouseValidated && [self.owner canSendInput];
-    NSString *title = self.gestureFeedback ?: (available ? (self.pressed ? @"Holding · Slide to drag" : @"Move pointer · Click to open") : @"Connect to control the phone");
+    NSString *title = self.gestureFeedback ?: (available ? (self.pressed ? @"Holding · Mouse drag" : @"Phone mouse pad") : @"Connect to control the phone");
     if (self.controlling) {
         NSPoint point = self.lastPoint;
         [NSColor.controlAccentColor setFill];
@@ -989,10 +994,14 @@ static uint8_t PhysicalModifiers(NSEventModifierFlags flags) {
         [cross moveToPoint:NSMakePoint(point.x-11,point.y)]; [cross lineToPoint:NSMakePoint(point.x+11,point.y)];
         [cross moveToPoint:NSMakePoint(point.x,point.y-11)]; [cross lineToPoint:NSMakePoint(point.x,point.y+11)]; [cross stroke];
     }
-    [title drawAtPoint:NSMakePoint(16,28) withAttributes:@{NSFontAttributeName:[NSFont systemFontOfSize:14 weight:NSFontWeightMedium],NSForegroundColorAttributeName:NSColor.labelColor}];
+    [title drawAtPoint:NSMakePoint(16,12) withAttributes:@{NSFontAttributeName:[NSFont systemFontOfSize:14 weight:NSFontWeightMedium],NSForegroundColorAttributeName:NSColor.labelColor}];
     NSDictionary *hint = @{NSFontAttributeName:[NSFont systemFontOfSize:11],NSForegroundColorAttributeName:NSColor.secondaryLabelColor};
-    [@"Click to tap · Hold + drag to swipe content" drawAtPoint:NSMakePoint(16,56) withAttributes:hint];
-    [@"2 fingers: scroll ↕ · Slide content ↔" drawAtPoint:NSMakePoint(16,73) withAttributes:hint];
+    NSArray *guide = @[@"Move to point · Click to select/open",
+                      @"2 fingers up/down: scroll · Change speed below",
+                      @"Hold + drag or 2 fingers sideways: mouse drag",
+                      @"May select text/items; phone swipes depend on the app."];
+    for (NSUInteger i = 0; i < guide.count; i++)
+        [guide[i] drawAtPoint:NSMakePoint(16,36+16*i) withAttributes:hint];
 }
 @end
 
@@ -1001,10 +1010,17 @@ static uint8_t PhysicalModifiers(NSEventModifierFlags flags) {
     if ((self = [super init])) {
         _heldKeys = [NSMutableOrderedSet orderedSet]; _motion = [PointerMotion new];
         _inputControls = [NSMutableArray array];
+        _scrollScale = 0.125;
     }
     return self;
 }
 - (BOOL)canSendInput { return self.session.ready && !self.session.suspended && !self.busy && !self.paused; }
+- (void)changeScrollSpeed:(id)sender {
+    [self resetPointer];
+    NSInteger choice = self.scrollSpeedPicker.selectedItem.tag;
+    self.scrollScale = choice == 3 ? 0.125 : choice == 2 ? 1.5 : choice == 1 ? 1.0 : 0.5;
+    if (sender) [NSUserDefaults.standardUserDefaults setInteger:choice forKey:@"AnikeyScrollSpeed"];
+}
 - (void)resizePad:(NSSlider *)sender {
     [self resetPointer];
     double value = MAX(0,MIN(1,self.padSizeSlider.doubleValue));
@@ -1067,10 +1083,26 @@ static uint8_t PhysicalModifiers(NSEventModifierFlags flags) {
     NSArray *keys = @[@"Enter",@"Tab",@"Backspace",@"Esc"];
     for (NSUInteger i = 0; i < keys.count; i++) [self keyButton:keys[i] chord:keys[i] frame:NSMakeRect(20+i*108,288,100,34) in:root];
     NSButton *paste = [self button:@"Type clipboard" frame:NSMakeRect(452,288,148,34) in:root action:@selector(pasteClipboard:)]; [self.inputControls addObject:paste];
-    NSTextField *footer = [self label:@"US keyboard layout · Input is sent only while connected.\nClick the typing area to use your Mac keyboard." frame:NSMakeRect(20,16,580,40) in:root];
+    NSTextField *footer = [self label:@"Click the typing area to use your Mac keyboard.\nUS layout · ⌘⇧Esc returns focus to your Mac." frame:NSMakeRect(20,16,400,40) in:root];
+    self.scrollSpeedPicker = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(432,22,168,28) pullsDown:NO];
+    [self.scrollSpeedPicker addItemsWithTitles:@[@"Scroll: Extra slow",@"Scroll: Gentle",@"Scroll: Standard",@"Scroll: Fast"]];
+    // Stable tags preserve existing saved choices when adding a slower preset.
+    NSArray *speedTags = @[@3,@0,@1,@2];
+    for (NSUInteger i = 0; i < speedTags.count; i++) [self.scrollSpeedPicker itemAtIndex:i].tag = [speedTags[i] integerValue];
+    id savedSpeed = [NSUserDefaults.standardUserDefaults objectForKey:@"AnikeyScrollSpeed"];
+    NSInteger speed = [savedSpeed isKindOfClass:NSNumber.class] ? [savedSpeed integerValue] : 3;
+    if (![self.scrollSpeedPicker selectItemWithTag:speed]) [self.scrollSpeedPicker selectItemWithTag:3];
+    self.scrollSpeedPicker.target = self; self.scrollSpeedPicker.action = @selector(changeScrollSpeed:);
+    self.scrollSpeedPicker.accessibilityLabel = @"Two-finger scroll speed";
+    self.scrollSpeedPicker.toolTip = @"Adjust two-finger vertical scrolling. Pointer movement and held-click dragging keep their speed.";
+    self.scrollSpeedPicker.autoresizingMask = NSViewMinXMargin;
+    [root addSubview:self.scrollSpeedPicker]; [self changeScrollSpeed:nil];
     self.cursorPad = [[CursorPad alloc] initWithFrame:NSMakeRect(110,68,400,172)]; self.cursorPad.owner = self;
     self.cursorPad.accessibilityElement = YES; self.cursorPad.accessibilityRole = NSAccessibilityGroupRole;
-    self.cursorPad.accessibilityLabel = @"Phone cursor and navigation gesture pad"; [root addSubview:self.cursorPad];
+    self.cursorPad.accessibilityLabel = @"Phone mouse pad";
+    self.cursorPad.toolTip = @"Move to point; click to select or open. Two fingers up/down scroll; adjust sensitivity with Scroll speed below. Hold and drag, or move two fingers sideways, to send a mouse drag. Android apps may select text or move items instead of swiping pages. Use Back, Home, and Recents for system navigation.";
+    self.cursorPad.accessibilityHelp = self.cursorPad.toolTip;
+    [root addSubview:self.cursorPad];
     [self label:@"Pad size" frame:NSMakeRect(20,252,72,20) in:root];
     self.padSizeSlider = [NSSlider sliderWithValue:0.2 minValue:0 maxValue:1 target:self action:@selector(resizePad:)];
     NSNumber *savedSize = [NSUserDefaults.standardUserDefaults objectForKey:@"AnikeyPadSize"];

@@ -451,6 +451,7 @@ static NSEvent *PadTouches(NSUInteger count, NSTouchPhase phase, double y) {
 }
 static void PadGestureTests(void) {
     AnikeyApp *app = [AnikeyApp new]; TestSession *session = [TestSession new]; app.session = session;
+    app.scrollScale = 1;
     CursorPad *pad = [[CursorPad alloc] initWithFrame:NSMakeRect(0,0,400,140)]; app.cursorPad = pad; pad.owner = app;
     [pad scrollWheel:PadScroll(NSEventPhaseBegan,0,0,0)];
     [pad scrollWheel:PadScroll(NSEventPhaseChanged,0,-24,0)]; [app flushPointer:nil];
@@ -529,8 +530,50 @@ static void PadGestureTests(void) {
     while (app.transport.thread && NSProcessInfo.processInfo.systemUptime < deadline) Pump(0.005);
     Check(!app.transport.thread,@"Gesture worker terminates after cancellation");
 }
+static void PadScrollResponsivenessTests(void) {
+    AnikeyApp *app = [AnikeyApp new]; TestSession *session = [TestSession new]; app.session = session;
+    CursorPad *pad = [[CursorPad alloc] initWithFrame:NSMakeRect(0,0,400,140)]; app.cursorPad = pad; pad.owner = app;
+    Check(app.scrollScale == 0.125,@"Two-finger scrolling starts with extra-slow sensitivity");
+    [pad scrollWheel:PadScroll(NSEventPhaseBegan,0,12,0)];
+    Check(!session.packets.count && app.motion.wheel == 0.125,@"Extra-slow scrolling retains small movements without a jump");
+    [pad scrollWheel:PadScroll(NSEventPhaseChanged,0,84,0)];
+    Check(session.packets.count == 1,@"A complete wheel step is sent without waiting for the timer");
+    Expect(session,0,NO,@"A1 0A 00 00 00 00 01");
+    [pad scrollWheel:PadScroll(NSEventPhaseEnded,0,0,0)];
+    [session.packets removeAllObjects];
+    // A latched AppKit scroll may reach the view after its began event.
+    [pad scrollWheel:PadScroll(NSEventPhaseChanged,30,0,0)];
+    Check(app.pointerButtons == 1 && session.packets.count == 2,@"A sideways stream can start from its first changed event");
+    [pad touchesCancelledWithEvent:PadTouches(2,NSTouchPhaseCancelled,0.5)];
+    Check(pad.gestureActive && app.pointerButtons == 1,@"Raw touch cancellation does not abort a recognized sideways scroll");
+    [pad scrollWheel:PadScroll(NSEventPhaseChanged,-20,0,0)];
+    Expect(session,2,NO,@"A1 0A 01 EC 00 00 00");
+    [pad scrollWheel:PadScroll(NSEventPhaseEnded,0,0,0)];
+    Expect(session,3,NO,@"A1 0A 00 00 00 00 00");
+    Check(!app.pointerButtons && !pad.gestureActive,@"Scroll completion releases after raw touch ownership changes");
+    app.scrollSpeedPicker = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+    [app.scrollSpeedPicker addItemsWithTitles:@[@"Extra slow",@"Gentle",@"Standard",@"Fast"]];
+    NSArray *tags = @[@3,@0,@1,@2];
+    for (NSUInteger i = 0; i < tags.count; i++) [app.scrollSpeedPicker itemAtIndex:i].tag = [tags[i] integerValue];
+    [app.scrollSpeedPicker selectItemWithTag:3]; [app changeScrollSpeed:nil];
+    Check(app.scrollScale == 0.125,@"Extra slow is four times slower than Gentle");
+    for (NSNumber *index in @[@0,@1,@2]) {
+        [app.scrollSpeedPicker selectItemWithTag:index.integerValue]; [app changeScrollSpeed:nil];
+        Check(app.scrollScale == 0.5+0.5*index.integerValue,@"Each scroll speed has the expected multiplier");
+    }
+    [session.packets removeAllObjects];
+    [pad scrollWheel:PadScroll(NSEventPhaseBegan,0,24,0)];
+    Expect(session,0,NO,@"A1 0A 00 00 00 00 03");
+    [pad scrollWheel:PadScroll(NSEventPhaseCancelled,0,0,0)];
+    [session.packets removeAllObjects];
+    PadTestEvent *wheel = (PadTestEvent *)PadScroll(NSEventPhaseNone,0,1,0); wheel.hasPreciseScrollingDeltas = NO;
+    [pad scrollWheel:(NSEvent *)wheel];
+    Expect(session,0,NO,@"A1 0A 00 00 00 00 01");
+    Check(session.packets.count == 1,@"Physical mouse-wheel detents keep their original sensitivity and send immediately");
+}
 static void PadScrollCompletionTests(void) {
     AnikeyApp *app = [AnikeyApp new]; TestSession *session = [TestSession new]; app.session = session;
+    app.scrollScale = 1;
     CursorPad *pad = [[CursorPad alloc] initWithFrame:NSMakeRect(0,0,400,140)]; app.cursorPad = pad; pad.owner = app;
     app.transport = [TransportWorker new];
     for (NSUInteger scenario = 0; scenario < 3; scenario++) {
@@ -565,6 +608,7 @@ static NSEvent *PadMouse(CursorPad *pad, NSEventType type, double x, double y) {
 }
 static void PadInteractionTests(void) {
     AnikeyApp *app = [AnikeyApp new]; TestSession *session = [TestSession new]; app.session = session;
+    app.scrollScale = 0.5;
     app.window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0,0,400,160) styleMask:NSWindowStyleMaskTitled backing:NSBackingStoreBuffered defer:NO];
     app.window.releasedWhenClosed = NO;
     CursorPad *pad = [[CursorPad alloc] initWithFrame:NSMakeRect(0,0,400,160)]; app.cursorPad = pad; pad.owner = app;
@@ -610,8 +654,9 @@ static void PadInteractionTests(void) {
     [pad mouseDown:PadMouse(pad,NSEventTypeLeftMouseDown,200,80)];
     Check(!pad.gestureActive && pad.pressed && app.pointerButtons == 1,@"Clicking takes over immediately from an unfinished scroll gesture");
     [pad mouseUp:PadMouse(pad,NSEventTypeLeftMouseUp,200,80)];
-    Check(session.packets.count == 2,@"Taking over from a scroll drops pending wheel movement and produces one tap");
-    Expect(session,0,NO,@"A1 0A 01 00 00 00 00"); Expect(session,1,NO,@"A1 0A 00 00 00 00 00");
+    Check(session.packets.count == 3,@"Scroll is delivered immediately; clicking then produces one tap without replaying it");
+    Expect(session,0,NO,@"A1 0A 00 00 00 00 01");
+    Expect(session,1,NO,@"A1 0A 01 00 00 00 00"); Expect(session,2,NO,@"A1 0A 00 00 00 00 00");
     [app.window orderOut:nil];
 }
 static void PadDragTests(void) {
@@ -956,7 +1001,7 @@ static void UISmokeTest(NSString *destination) {
 }
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
-        if (argc == 3 && strcmp(argv[1],"--ui-smoke") == 0) { UISmokeTest(@(argv[2])); PadGestureTests(); PadScrollCompletionTests(); PadInteractionTests(); PadDragTests(); ResponsiveConnectionTest(); BoundedQuitTest(); }
+        if (argc == 3 && strcmp(argv[1],"--ui-smoke") == 0) { UISmokeTest(@(argv[2])); PadGestureTests(); PadScrollResponsivenessTests(); PadScrollCompletionTests(); PadInteractionTests(); PadDragTests(); ResponsiveConnectionTest(); BoundedQuitTest(); }
         else { DescriptorTests(); MouseTests(); NavigationTests(); InputTests(); ProtocolTests(); ForwardingTests(); ConnectionLifecycleTests(); WorkerTests(); }
         printf("PASS: %u checks (no Bluetooth accessed)\n",Checks);
     }

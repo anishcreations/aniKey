@@ -51,9 +51,11 @@ Move over the pad to move the phone's mouse pointer. Click to send a tap; hold a
 
 Use **Back**, **Home**, and **Recents** for system navigation. Recents sends the Windows/Meta+Tab keyboard shortcut; phone firmware may handle it differently. A secondary click on the pad sends the secondary mouse button.
 
-Use **Pad size** or resize the window to adjust the area. Leaving the pad or switching away releases held input. The local marker shows Mac input, not the phone cursor's exact position. Three-finger gestures remain with macOS; scroll momentum is not forwarded.
+Use **Pad size** or resize the window to adjust the area. **Scroll: Extra slow / Gentle / Standard / Fast** adjusts two-finger vertical scrolling and remembers your choice. Extra slow is the default; pointer movement and held-click dragging keep their speed.
 
-aniKey sends Bluetooth mouse and keyboard input, not touchscreen contacts. Android apps determine whether a mouse drag scrolls content or activates an item. Phone edge gestures, pinch-to-zoom, and touch-only interactions are not provided. Sideways two-finger movement is sent as a mouse drag.
+Leaving the pad or switching away releases held input. The local marker shows Mac input, not the phone cursor's exact position. Three-finger gestures remain with macOS; scroll momentum is not forwarded.
+
+The pad shows a quick guide to pointing, clicking, scrolling, and dragging. aniKey sends Bluetooth mouse and keyboard input, not touchscreen contacts. A mouse drag may select text or move an item instead of swiping a page, depending on the Android app. Phone edge gestures, pinch-to-zoom, and touch-only interactions are not provided. Sideways two-finger movement is sent as a mouse drag.
 
 ## Command line
 
